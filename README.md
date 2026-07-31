@@ -33,6 +33,68 @@ Cooperative perception aims to address the inherent limitations of single-vehicl
 - [Prepare Dataset](./docs/DATA_PREP.md)
 - [Train/Val](./docs/TRAIN_EVAL.md)
 
+## Adaptive Fusion Plugin (DGC + UGIM)
+
+This checkout ships with the **end-to-end Adaptive Fusion** plugin from
+*End-to-End Adaptive Fusion for Robust Aerial-Ground Cooperative 3D Detection*
+that targets three architectural defects in vanilla CoopTrack:
+
+- Correction-after-matching (Bug 1)
+- Confidence-feature positive feedback (Bug 2)
+- Shared GRU across mismatched agents (Bug 3)
+
+### Module map
+
+| Module | File | Purpose |
+|---|---|---|
+| **DGC / HeightAdaptiveFusion** | `projects/mmdet3d_plugin/cooptrack/modules/height_adaptive_fusion.py` | Residual altitude-aware coordinate correction with 64-d sinusoidal PE; applied **before** bipartite matching so the matching itself runs on corrected coordinates. |
+| **UGIM / CAA + ACM** | `cross_agent_interaction.py` (`ContextAwareAssociation`) and `adaptive_fusion.py` (`CAA`, `ACM`) | CAA does semantic+geometric matching; ACM predicts per-query confidence from AAF displacement only — feature space and confidence space stay orthogonal. |
+| **Dual GRU** | `adaptive_fusion.py` (`VehicleGRU`, `InfrastructureGRU`) | Separate parameters per agent type, gated by `training_stage==3` to avoid feature-space mismatch in early stages. |
+| **Cross-View Embedding** | `cross_view_embedding.py` | InfoNCE-style contrastive head for shared embedding space (ablation only). |
+| **Communication Uncertainty** | `communication_uncertainty.py` | Latency compensation + packet-loss handling (ablation only). |
+| **Runtime profiler** | `cross_agent_interaction.py` (`AgentRuntimeProfiler`) | Per-module latency tracker used by `tools/analysis_tools/profile_model.py`. |
+
+### Config flag reference
+
+| Flag | Default | Stage | Purpose |
+|---|---|---|---|
+| `use_aaf` | True | 3 | Enable DGC / Height-Adaptive Fusion. |
+| `use_caa` | True | 3 | Enable Context-Aware Association (UGIM). |
+| `use_emb` | False | 3 | Enable Cross-View Embedding (ablation only). |
+| `use_comm` | False | 3 | Enable Communication Uncertainty (ablation only). |
+| `use_gru` | False | 3 | Enable Dual GRU (gated by `training_stage==3`). |
+| `h_ref` | 25.0 | 3 | Reference drone altitude (m) for height-weighted fusion. |
+| `training_stage` | 3 | 1/2/3 | `1=vehicle-only`, `2=infrastructure-only`, `3=cooperative`. |
+
+### Three-stage training configs
+
+| Stage | Config |
+|---|---|
+| 1 — vehicle-only single-end | `projects/configs_spd_veh/cooptrack/uaf_gaf_track_r50_stream_bs8_48epoch_3cls_veh.py` |
+| 2 — infrastructure-only single-end (saves track queries for Stage 3) | `projects/configs_spd_inf/cooptrack/uaf_gaf_track_r50_stream_bs8_24epoch_3cls_inf.py` |
+| 3 — cooperative DGC+UGIM (default inference configuration) | `projects/configs_spd_coop/cooptrack/uaf_gaf_track_r50_stream_bs8_48epoch_3cls.py` |
+
+### Experiment orchestration
+
+```bash
+# 0) sanity check (1 epoch, tiny subset)
+bash tools/run_experiments.sh 0
+# 1) CoopTrack baseline
+bash tools/run_experiments.sh 1
+# 2) DGC only
+bash tools/run_experiments.sh 2
+# 3) DGC + UGIM  ← default inference configuration
+bash tools/run_experiments.sh 3
+# 4) ablations (4a=+Emb, 4b=+GRU, 4c=+Comm, 4d=full stack)
+bash tools/run_experiments.sh 4
+# 5) extrapolation curve + per-module runtime breakdown
+bash tools/run_experiments.sh 5
+```
+
+The runner overrides flags via `--cfg-options` so a single config covers the
+ablation grid; explicit per-stage configs (above) are provided for users who
+prefer one config per stage.
+
 ## Contact
 
 If you have any questions, please contact Jiaru Zhong via email (zhong.jiaru@outlook.com).

@@ -911,7 +911,7 @@ class CoopTrack(MVXTwoStageDetector):
                     inf_boxes = inf_instances.cache_bboxes.clone()
                     asso_label = self.STReasoner._gen_asso_label(gt_bboxes_3d[j], inf_boxes, veh_boxes, img_metas[j]['sample_idx'])
             # 3. Spatial-temporal reasoning
-            cur_track_instances, affinity = self.STReasoner(cur_track_instances, inf_instances)
+            cur_track_instances, affinity = self.STReasoner(cur_track_instances, inf_instances, veh2inf_rt=veh2inf_rt[j])
 
             if self.is_cooperation:
                 cur_out = dict()
@@ -1215,7 +1215,7 @@ class CoopTrack(MVXTwoStageDetector):
                 inf_dcit = self.crossview_alignment(inf_dcit, veh2inf_rt[0])
                 inf_instances = self._init_inf_tracks(inf_dcit)
         # Spatial-temporal Reasoning
-        track_instances, _ = self.STReasoner(track_instances, inf_instances, sample_idx)
+        track_instances, _ = self.STReasoner(track_instances, inf_instances, sample_idx, veh2inf_rt=veh2inf_rt[0])
         track_instances = self.frame_summarization(track_instances, tracking=True)
         out['all_cls_scores'][-1] = track_instances.pred_logits
         out['all_bbox_preds'][-1] = track_instances.pred_boxes

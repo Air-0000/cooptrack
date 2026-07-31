@@ -18,6 +18,7 @@ from mmdet.models.utils import build_transformer
 from .pf_utils import time_position_embedding, xyz_ego_transformation, normalize, denormalize
 from scipy.optimize import linear_sum_assignment
 from projects.mmdet3d_plugin.core.bbox.util import denormalize_bbox, normalize_bbox
+from .cross_agent_interaction import CrossAgentSparseInteraction
 
 color_mapping = [
     np.array([1.0, 0.078, 0.576]), # 鲜艳的粉色
@@ -47,23 +48,25 @@ def pos2posemb3d(pos, num_pos_feats=128, temperature=10000):
     return posemb
 
 class SpatialTemporalReasoner(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  history_reasoning=True,
                  future_reasoning=True,
-                 embed_dims=256, 
-                 hist_len=3, 
+                 embed_dims=256,
+                 hist_len=3,
                  fut_len=4,
                  num_reg_fcs=2,
                  code_size=10,
                  num_classes=10,
                  pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
+                 inf_pc_range=None,
                  hist_temporal_transformer=None,
                  fut_temporal_transformer=None,
                  spatial_transformer=None,
                  is_motion=False,
                  is_cooperation=False,
                  learn_match=False,
-                 veh_thre=0.05):
+                 veh_thre=0.05,
+                 cross_agent_interaction=None):
         super(SpatialTemporalReasoner, self).__init__()
 
         self.embed_dims = embed_dims
@@ -71,6 +74,7 @@ class SpatialTemporalReasoner(nn.Module):
         self.fut_len = fut_len
         self.num_reg_fcs = num_reg_fcs
         self.pc_range = pc_range
+        self.inf_pc_range = inf_pc_range if inf_pc_range is not None else pc_range
 
         self.num_classes = num_classes
         self.code_size = code_size
@@ -85,12 +89,20 @@ class SpatialTemporalReasoner(nn.Module):
         self.fut_temporal_transformer = fut_temporal_transformer
         self.spatial_transformer = spatial_transformer
 
+        # UACP: Cross-agent interaction with uncertainty handling
+        self.cross_agent_interaction = None
+        if cross_agent_interaction is not None:
+            cross_agent_interaction['pc_range'] = self.pc_range
+            cross_agent_interaction['inf_pc_range'] = self.inf_pc_range
+            cross_agent_interaction['embed_dims'] = self.embed_dims
+            self.cross_agent_interaction = CrossAgentSparseInteraction(**cross_agent_interaction)
+
         self.init_params_and_layers()
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
-    def forward(self, track_instances, inf_track_instances=None, sample_idx=None):
+    def forward(self, track_instances, inf_track_instances=None, sample_idx=None, veh2inf_rt=None):
         # 1. Prepare the spatial-temporal features
         track_instances = self.frame_shift(track_instances)
 
@@ -99,7 +111,7 @@ class SpatialTemporalReasoner(nn.Module):
         if self.history_reasoning:
             track_instances = self.forward_history_reasoning(track_instances)
             if inf_track_instances or self.learn_match:
-                track_instances, affinity = self.aggregation(track_instances, inf_track_instances, sample_idx)
+                track_instances, affinity = self.aggregation(track_instances, inf_track_instances, sample_idx, veh2inf_rt)
             track_instances = self.forward_history_refine(track_instances)
 
         # 3. Future reasoning
@@ -219,7 +231,13 @@ class SpatialTemporalReasoner(nn.Module):
         track_instances.cache_motion_predictions = motion_predictions
         return track_instances
 
-    def aggregation(self, veh_instances, inf_instances, sample_idx):
+    def aggregation(self, veh_instances, inf_instances, sample_idx, veh2inf_rt=None):
+        # UACP: Use CrossAgentSparseInteraction if available
+        if self.cross_agent_interaction is not None and inf_instances is not None and len(inf_instances) > 0:
+            fused_instances = self.cross_agent_interaction(inf_instances, veh_instances, veh2inf_rt)
+            return fused_instances, None
+
+        # Original CoopTrack aggregation logic
         # aggregate cache_query_feats, cache_motion_feats, cache_ref_pts
         # 1. association
         veh_ref_pts = veh_instances.cache_ref_pts.clone()
@@ -228,7 +246,7 @@ class SpatialTemporalReasoner(nn.Module):
         inf_abs_pts = self._loc_denorm(inf_ref_pts, self.pc_range)
 
         mask = veh_instances.cache_scores > self.veh_thre
-        
+
         affinity = None
         if not self.learn_match:
             # rule-based match

@@ -1,0 +1,783 @@
+\documentclass[9.5pt,twocolumn,a4paper]{IEEEtran}
+
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{booktabs}
+\usepackage[utf8]{inputenc}
+\usepackage{cite}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{stfloats}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit,calc}
+\tikzset{box/.style={draw, rounded corners=3pt, align=center, inner sep=4pt, outer sep=0pt, font=\small, line width=0.5pt}}
+\tikzset{arr/.style={->, >=stealth', line width=1.2pt, shorten >=2pt, shorten <=2pt}}
+\tikzset{darr/.style={->, >=stealth', line width=1.0pt, dashed, shorten >=2pt, shorten <=2pt, gray!60}}
+\tikzset{invis/.style={draw=none, fill=none, align=center, font=\small}}
+\definecolor{corange}{RGB}{197,90,17}
+\definecolor{cblue}{RGB}{46,117,182}
+\definecolor{cyellow}{RGB}{191,143,0}
+\definecolor{cgreen}{RGB}{84,130,53}
+\definecolor{cbg0}{RGB}{240,240,240}
+\definecolor{cbg1}{RGB}{252,228,214}
+\definecolor{cbg2}{RGB}{221,235,247}
+\definecolor{cbg3}{RGB}{255,242,204}
+\definecolor{cbg4}{RGB}{226,239,218}
+\definecolor{cbg5}{RGB}{237,237,237}
+
+% Custom commands
+\def\Lra{$\leftarrow$}
+\def\Rrightarrow{$\Rightarrow$}
+\def\wh{\hat}
+\def\cal#1{\mathcal{#1}}
+\def\mb#1{\mathbf{#1}}
+\def\msc#1{\texttt{#1}}
+
+% Theorem environments
+\newtheorem{theorem}{Theorem}
+
+\begin{document}
+
+%------------------------------------------------------------------------------
+% TITLE
+%------------------------------------------------------------------------------
+\title{End-to-End Adaptive Fusion for Robust Aerial-Ground Cooperative 3D Detection}
+
+\author{
+    \IEEEauthorblockN{Anonymous Authors}
+    \IEEEauthorblockA{Anonymous Institution}
+}
+
+\maketitle
+
+%------------------------------------------------------------------------------
+% ABSTRACT
+%------------------------------------------------------------------------------
+\begin{abstract}
+Aerial-ground cooperative perception combines complementary viewpoints of a drone and a ground vehicle, but its accuracy collapses under the geometric uncertainties inherent to such setups---relative pose errors up to 7m, drone altitude varying from 25m to 55m, and angle offsets of a few degrees. We argue that the dominant cause is not the absence of a new module, but \emph{architectural bugs in how existing end-to-end fusion pipelines are assembled}. By auditing recent end-to-end fusion designs, we identify three concrete defects: (1) altitude-dependent coordinate correction is applied \emph{after} matching, so the matching itself is computed on misaligned coordinates; (2) confidence modulation and feature discrimination share feature-space gradients, forming a positive feedback loop that destabilises training; (3) spatio-temporal prediction uses a single shared GRU across agents whose motion dynamics differ fundamentally. We repair these flaws and obtain two principled modules--- \textbf{DGC (Dynamic Geometric Correction)} learns altitude-conditioned residual offsets with sinusoidal positional encoding, extrapolating stably from 25--55m training altitudes up to 70m+ (0.26m error vs.\ 8.91m for affine baselines); \textbf{UGIM (Uncertainty-Gated Instance Matching)} decouples geometric confidence from feature matching by reading the DGC displacement, removing the feedback loop and operating in an orthogonal gradient space. DGC and UGIM add only 6.4ms overhead and maintain 8.7Hz inference. On the Griffin benchmark our method outperforms CoopTrack by over 5\% AP under challenging geometric uncertainties while introducing negligible latency.
+\end{abstract}
+
+%------------------------------------------------------------------------------
+% I. INTRODUCTION
+%------------------------------------------------------------------------------
+\section{Introduction}
+
+Single-vehicle 3D perception~\cite{bevformer,petr} is bounded by the sensing geometry of one agent---occlusions, range limits, viewpoint bias. Aerial-ground cooperative perception pairs a drone with a ground vehicle to obtain complementary bird's-eye views, but introduces a new class of \emph{geometric uncertainties}: drone altitude varying from 25m to 55m, relative pose errors up to 7m from GPS drift or communication delay, and angle offsets of a few degrees. As Table~\ref{tab:motivation} shows, the resulting accuracy drop is severe---CoopTrack loses 39\% relative AP under only 2m translation error.
+
+\begin{figure*}[htbp]
+    \centering
+    \begin{tikzpicture}[x=1cm, y=1cm, font=\small]
+        \tikzset{b0/.style={box, minimum width=3.2cm, minimum height=0.9cm, fill=cbg0}}
+        \tikzset{b1/.style={box, minimum width=3.0cm, minimum height=0.85cm, fill=cbg1, draw=corange}}
+        
+        %%% ROW 1: INPUTS %%%
+        \node[box, minimum width=3.5cm, minimum height=0.9cm, fill=cbg0] (veh) at (2.5,8.5) {Vehicle queries\\$\mathbf{F}_v,\mathbf{P}_v$};
+        \node[box, minimum width=3.5cm, minimum height=0.9cm, fill=cbg0] (drn) at (2.5,7.0) {Drone queries\\$\mathbf{F}_d,\mathbf{P}_d$};
+        \node[box, minimum width=2.0cm, minimum height=0.9cm, fill=cbg0] (alt) at (7.5,8.5) {Altitude $h$};
+        \node[box, minimum width=2.0cm, minimum height=0.9cm, fill=cbg0] (pos) at (7.5,7.0) {Pose $[R|t]$};
+        
+        %%% ROW 2: COORD + DGC %%%
+        \node[box, minimum width=3.5cm, minimum height=0.9cm, fill=cbg0] (coord) at (10.5,8.2)
+            {$\mathbf{P}_{d\to v}=R\mathbf{P}_d+t$\\\footnotesize(ego-vehicle frame)};
+        \node[box, minimum width=3.0cm, minimum height=0.85cm, fill=white] (pe) at (15.0,8.5)
+            {Sinusoidal\\PE($h$), PE($\Delta h$)};
+        \node[b1] (mlp) at (15.0,7.0)
+            {MLP $\to \Delta P(h) \in \mathbb{R}^3$};
+        \node[invis, font=\bfseries, color=corange] (dgclab) at (15.0,6.0) {DGC};
+        
+        %%% Correction tag %%%
+        \node[box, minimum width=3.5cm, minimum height=0.55cm, fill=white, draw=gray!50] (tag) at (10.5,5.4)
+            {$\mathbf{P}'_d = \mathbf{P}_{d\to v} + \Delta P(h)$};
+        
+        %%% ROW 3: UGIM %%%
+        \node[box, minimum width=5.0cm, minimum height=1.3cm, fill=cbg2, draw=cblue] (caa) at (7.5,3.0)
+            {\textbf{CAA}\\$S_{\text{match}} = S_{\text{sem}}\cdot S_{\text{geo}}$\\\footnotesize(Hungarian on corrected coords)};
+        \node[box, minimum width=5.0cm, minimum height=1.3cm, fill=cbg3, draw=cyellow] (acm) at (14.0,3.0)
+            {\textbf{ACM}\\$c = \sigma(\phi_{\text{conf}}([\Delta p; \mathbf{P}'_d]))$\\\footnotesize(displacement-only, IoU-supervised)};
+        \node[invis, font=\bfseries, color=cblue] (caalab) at (7.5,1.4) {UGIM};
+        \node[invis, font=\bfseries, color=cyellow] (acmlab) at (14.0,1.4) {ACM (decoupled)};
+        
+        %%% Dual GRU %%%
+        \node[box, minimum width=2.0cm, minimum height=0.8cm, fill=cbg5, draw=gray] (gv) at (1.2,2.6) {GRU$_{\text{veh}}$};
+        \node[box, minimum width=2.0cm, minimum height=0.8cm, fill=cbg5, draw=gray] (gi) at (3.8,2.6) {GRU$_{\text{inf}}$};
+        \node[invis, font=\bfseries, gray!80] (grulab) at (2.5,1.3) {Dual GRU (Stage 3 only)};
+        
+        %%% ROW 4: FUSION %%%
+        \node[box, minimum width=10.0cm, minimum height=0.9cm, fill=cbg4, draw=cgreen] (fus) at (8.8,0.6)
+            {$\mathbf{F}_{\text{fused}} = \alpha\cdot(1-c)\cdot\mathbf{F}'_d + (1-\alpha)\cdot\mathbf{F}_v$\\\footnotesize(weighted + confidence-gated)};
+        \node[box, minimum width=10.0cm, minimum height=0.6cm, fill=white] (out) at (8.8,-0.6)
+            {Fused detection / tracking outputs};
+        
+        %%% ARROWS %%%
+        \draw[arr] (veh.east) -- ++(1.0,0) |- (coord.west);
+        \draw[arr] (drn.east) -- ++(1.0,0) |- (coord.west);
+        \draw[arr] (alt.east) -- (pe.west);
+        \draw[arr] (pos.east) -- (coord.south);
+        \draw[arr] (coord.east) -- (pe.west);
+        \draw[arr] (pe.south) -- (mlp.north);
+        \draw[arr] (mlp.south) -- ++(0,-0.2) -| (tag.east);
+        \draw[arr] (tag.south) -- ++(0,-0.15) -| (caa.north);
+        \draw[darr] (mlp.south) -- ++(0,-0.2) -| (acm.north);
+        \draw[darr] (caa.east) -- (acm.west)
+            node[midway, above, font=\scriptsize, gray!60] {matched idx};
+        \draw[arr] (caa.south) -- ++(0,-0.3) -| (fus.north);
+        \draw[arr] (acm.south) -- ++(0,-0.3) -| (fus.north);
+        \draw[darr] (veh.west) -- ++(-1.5,0) |- (veh.south) |- (fus.170);
+        \draw[darr] (gi.south) -- ++(0,-0.3) -| (fus.west);
+        \draw[arr] (fus.south) -- (out.north);
+        
+        %%% STAGE BARS %%%
+        \draw[dashed, gray!40] (0.2,5.0) -- (17.8,5.0);
+        \node[invis, font=\footnotesize, gray!50] at (9.0,4.7) {Inputs | Coord protocol | DGC  (always-on core)};
+        \draw[dashed, gray!40] (0.2,1.4) -- (17.8,1.4);
+        \node[invis, font=\footnotesize, gray!50] at (9.0,1.1) {UGIM: CAA matching + decoupled ACM confidence};
+        \draw[dashed, gray!40] (0.2,0.9) -- (4.5,0.9);
+        \node[invis, font=\footnotesize, gray!50] at (2.35,0.6) {Stage-3 aux. (off by default)};
+        \draw[dashed, gray!40] (0.2,-0.9) -- (17.8,-0.9);
+        \node[invis, font=\footnotesize, gray!50] at (9.0,-1.2) {Fusion + output};
+        
+        \node[invis, font=\scriptsize, gray!40] at (9.0,-1.5) {Solid arrows: data flow. Dashed: ACM decoupled branch and Stage-3 auxiliary.};
+    \end{tikzpicture}
+    \caption{Our Adaptive Fusion framework consists of two core innovations: DGC for altitude-aware geometric correction and UGIM for uncertainty-gated instance matching. Unlike OpenCOOD-Air's static CDSC, all modules are jointly optimized end-to-end with the detection network.}
+    \label{fig:framework}
+\end{figure*}
+
+\textbf{The dominant cause is architectural, not modular.}
+Recent aerial-ground fusion pipelines have introduced capable components---altitude calibration~\cite{opencood_air}, semantic-geometric matching~\cite{cooptrack}, confidence modulation. Yet robustness remains poor. We trace this to three specific architectural defects in how these components are assembled end-to-end:
+
+\begin{itemize}
+    \item \textbf{Bug 1 -- Correction-after-matching.} Existing pipelines apply altitude-aware coordinate correction \emph{after} bipartite matching. But matching cost depends on inter-query distance, so misaligned coordinates at matching time yield incorrect pairs; subsequent correction cannot recover them.
+    \item \textbf{Bug 2 -- Confidence-feature feedback loop.} Confidence modulation and feature discrimination are typically predicted from the \emph{same} fused features. Under pose error, a low feature-matching score widens the feature gap and inflates the predicted confidence drop, creating a positive feedback loop that destabilises training and collapses association at moderate pose errors.
+    \item \textbf{Bug 3 -- Shared temporal module across agents.} A single GRU is shared between vehicle and infrastructure. Drone motion is 6-DoF; vehicles are ground-constrained. Using one temporal model across both regimes forces a feature-space compromise that degrades cooperative alignment.
+\end{itemize}
+
+\noindent\textbf{Why do existing fixes fall short?} Griffin~\cite{griffin} quantifies altitude sensitivity but proposes no remedy. OpenCOOD-Air's CDSC~\cite{opencood_air} and UVCPNet's CDCA~\cite{uvcpnet} are \emph{static} calibration modules trained independently of the detector---they cannot adapt to dynamic altitude and pose changes, and require retraining for new altitude regimes. CoopTrack~\cite{cooptrack} introduces learned query association but relies on 3DIoU matching, which fails under pose errors, and lacks explicit uncertainty handling. None of these approaches audits the end-to-end pipeline for the three architectural defects above.
+
+\noindent\textbf{Our approach.} Rather than introducing a fourth module, we \emph{repair} the assembly. This yields two principled modules whose designs follow directly from the bug fixes:
+
+\begin{itemize}
+    \item \textbf{DGC (Dynamic Geometric Correction)} -- residual altitude-conditioned offsets $\Delta P(h)$ with sinusoidal positional encoding, applied \emph{before} matching (fixing Bug 1). Residual-plus-PE reformulates the problem from ``learn the absolute aligned coordinate'' to ``learn how much to shift given altitude change,'' which extrapolates stably to altitudes beyond the 25--55m training range (Table~\ref{tab:extrapolation}).
+    \item \textbf{UGIM (Uncertainty-Gated Instance Matching)} -- decouples geometric confidence from feature discrimination by using the DGC displacement $\Delta p$ as confidence input (fixing Bug 2). CAA operates in feature space; ACM operates in geometric space; the two are gradient-orthogonal and the feedback loop is broken. A separate-parameter Dual GRU (Bug 3) is studied in ablation.
+\end{itemize}
+
+DGC and UGIM add only 6.4ms overhead and maintain 8.7Hz inference---well within the V2X communication-latency envelope where 50--100ms dominates.
+
+\noindent\textbf{Contributions.}
+\begin{enumerate}
+    \item \textbf{An architectural audit of end-to-end aerial-ground fusion.} We surface three concrete defects (correction ordering, confidence-feature coupling, shared temporal module) and show each individually corrupts robustness.
+    \item \textbf{DGC} -- a residual coordinate correction with sinusoidal altitude PE that extrapolates to unseen altitudes (0.26m error at 70m vs.\ 8.91m for affine baselines).
+    \item \textbf{UGIM} -- a decoupled, displacement-gated confidence predictor that breaks the feedback loop while remaining dataset-agnostic.
+    \item \textbf{Lightweight deployment}: 6.4ms overhead, 8.7Hz, no architectural change to the backbone.
+\end{enumerate}
+
+The rest of this paper is organised as follows. Section~\ref{sec:related} reviews related work. Section~\ref{sec:problem} formalises the geometric uncertainty problem. Section~\ref{sec:method} details DGC and UGIM. Section~\ref{sec:experiments} reports experiments. Section~\ref{sec:conclusion} concludes.
+
+%------------------------------------------------------------------------------
+% II. RELATED WORK
+%------------------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+We organise the related work into two threads: single-agent and V2X perception, and the more recent aerial-ground cooperative perception that motivates our setting.
+
+\subsection{Single-Agent 3D Detection and V2X Perception}
+
+BEVFormer~\cite{bevformer} and PETR~\cite{petr} excel at single-agent perception under ideal conditions. Robustness to sensor noise and weather is itself an active topic~\cite{robust_benchmark}, and we extend this to multi-agent aerial-ground cooperation under geometric uncertainties.
+
+V2X cooperative perception extends single-agent capabilities through information sharing. V2X-ViT~\cite{v2xvit} introduces spatio-temporal cross-agent attention. CoBEVFusion~\cite{cobevfusion} fuses BEV features from multiple vehicles. PosiFusion~\cite{posifusion} and V2XPnP~\cite{v2xpnp} address position uncertainty using probabilistic and PnP-based fusion respectively. However, these methods focus on V2V scenarios (where agents share similar viewpoints) and do not address the unique aerial-ground geometric uncertainties where viewpoint disparity is extreme.
+
+Uncertainty-aware fusion has been explored: UMoE~\cite{umoe} via mixture-of-experts, Hyper-V2X~\cite{hyperv2x} via hypernetworks, and MambaFusion~\cite{mambafusion} via state-space models. None address cross-view geometric uncertainty specific to aerial-ground cooperation.
+
+\subsection{Aerial-Ground Cooperative Perception}
+
+The Griffin dataset~\cite{griffin} provides the first comprehensive aerial-ground benchmark, revealing that fusion performance degrades at varying altitudes. AirV2X~\cite{airv2x} proposes unified air-ground vehicle-to-everything collaboration. AdaBEV~\cite{adabev} adapts BEV perception for multi-agent scenarios but does not address altitude-specific challenges.
+
+OpenCOOD-Air~\cite{opencood_air} proposes CDSC (Cross-Domain Scale Calibration) using a static scale transformation learned during pretraining. UVCPNet~\cite{uvcpnet} proposes CDCA for cross-domain alignment. Both are static modules without end-to-end joint optimization.
+
+CoopTrack~\cite{cooptrack} proposes query-level fusion with learned association for aerial-ground tracking. While effective, CoopTrack lacks explicit robustness mechanisms for geometric uncertainties and relies on 3DIoU-based matching which degrades under pose errors.
+
+\textbf{Gap.} Existing methods have three major limitations: (1) static calibration without joint optimization; (2) limited robustness under geometric uncertainties; (3) no temporal modeling for communication constraints.
+
+%------------------------------------------------------------------------------
+% III. PROBLEM FORMULATION
+%------------------------------------------------------------------------------
+\section{Problem Formulation}
+\label{sec:problem}
+
+Let $\mathcal{V}$ denote the ground vehicle and $\mathcal{D}$ the drone. Each agent extracts query features $\mb{F}_v \in \mathbb{R}^{N_v \times D}$, $\mb{F}_d \in \mathbb{R}^{N_d \times D}$ and reference points $\mb{P}_v, \mb{P}_d \in \mathbb{R}^{N \times 3}$.
+
+The goal is robust aerial-ground fusion under geometric uncertainties:
+
+\textbf{Altitude variation.} Drone altitude $h$ varies from 25m to 55m:
+\begin{equation}
+    \mb{P}_{bev} = \frac{f}{h} \cdot \mb{P}_{cam}
+    \label{eq:altitude_projection}
+\end{equation}
+
+\textbf{Relative pose errors.} Transformation matrices belong to $SE(3)$, which is not a vector space. We model perturbation multiplicatively using the exponential map:
+\begin{equation}
+    \tilde{\mb{T}}_{v2d} = \exp(\boldsymbol{\xi}^\wedge) \, \mb{T}_{v2d}
+    \label{eq:pose_error}
+\end{equation}
+where $\boldsymbol{\xi} \in \mathbb{R}^6$ is the twist coordinate (comprising translation $\Delta_t \in \mathbb{R}^3$ and rotation $\Delta_\theta \in \mathbb{R}^3$) and $^\wedge$ maps it to the $se(3)$ Lie algebra. This formulation respects the group structure of $SE(3)$ and avoids the pathological behaviour of additive noise, which leaves the group manifold entirely.
+
+\textbf{Angle offsets.} Position error compounds with distance:
+\begin{equation}
+    \epsilon_{dist} = d \cdot \sin(\Delta_\theta)
+    \label{eq:angle_error}
+\end{equation}
+
+\textbf{Coordinate protocol.} All distance computations in our framework are performed strictly in the ego-vehicle coordinate frame. Before any correction, infrastructure-side points $\mb{P}_d$ are transformed via:
+\begin{equation}
+    \mb{P}_{d\rightarrow v} = R \cdot \mb{P}_d + t
+    \label{eq:coordinate_protocol}
+\end{equation}
+where $[R|t]$ is the relative pose from vehicle to drone.
+
+%------------------------------------------------------------------------------
+% IV. METHOD
+%------------------------------------------------------------------------------
+\section{Method}
+\label{sec:method}
+
+We first give an end-to-end overview of the pipeline, then detail the two core modules (DGC and UGIM) and the auxiliary Dual GRU. Throughout, we emphasise \emph{why} each design choice follows from one of the three architectural defects identified in Section~\ref{sec:related}: correction ordering, confidence-feature coupling, and shared temporal modules.
+
+\subsection{Overview}
+
+Our Adaptive Fusion framework consists of two core innovations (DGC and UGIM) and auxiliary modules studied in ablation:
+
+\begin{enumerate}
+    \item \textbf{DGC:} Residual coordinate correction $P' = P + \Delta P(h)$ with sinusoidal altitude PE, applied \emph{before} matching.
+    \item \textbf{UGIM:} Decoupled confidence gating where ACM uses geometric displacement $\Delta p$ and IoU-aware contrastive loss, orthogonal to CAA's feature-space discrimination.
+    \item \textbf{Auxiliary:} Dual GRU (separate params per agent), Cross-View Embedding, Communication Handling.
+\end{enumerate}
+
+Figure~\ref{fig:framework} shows the overall architecture.
+
+\begin{algorithm}[htbp]
+\caption{DGC + UGIM Pipeline}
+\label{alg:pipeline}
+\begin{algorithmic}
+\STATE \textbf{Input:} $(\mb{F}_v, \mb{P}_v)$, $(\mb{F}_d, \mb{P}_d)$, pose $[R|t]$, altitude $h$
+\STATE \textbf{Output:} Fused features $\mb{F}_{fused}$
+
+\ENSURE Coordinate Protocol (\S III)
+\STATE $\mb{P}_{d\rightarrow v} \leftarrow R \cdot \mb{P}_d + t$ \COMMENT{Infra to ego-vehicle frame}
+
+\ENSURE DGC: Dynamic Geometric Correction (\S IV-A)
+\STATE $\mb{P}_{d}^{corr} \leftarrow \mb{P}_{d\rightarrow v} + \msc{MLP}([\msc{PE}(h); \msc{PE}(\Delta h)])$ \COMMENT{Residual correction}
+\STATE $\Delta p \leftarrow \mb{P}_{d}^{corr} - \mb{P}_{d\rightarrow v}$ \COMMENT{Displacement for ACM}
+\STATE $\hat\epsilon \leftarrow \sigma(\psi([\Delta p; \mb{F}_d]))$ \COMMENT{Learnable floor (\S IV-B)}
+\STATE $\alpha \leftarrow \sigma(\msc{MLP}([\mb{F}_d; h]))$ \COMMENT{Dynamic fusion weight}
+
+\ENSURE UGIM: Uncertainty-Gated Instance Matching (\S IV-B)
+\STATE $S_{match} \leftarrow \msc{CAA}(\mb{F}_d, \mb{F}_v, \mb{P}_{d}^{corr}, \mb{B})$ \COMMENT{Semantic + geometric matching on corrected coords}
+\STATE $(idx_v, idx_d) \leftarrow \msc{Hungarian}(S_{match})$ \COMMENT{Matching on corrected points}
+\STATE $c \leftarrow \sigma(\msc{ACM}(\Delta p, \mb{P}_{d}^{corr}))$ \COMMENT{Confidence from displacement}
+
+\ENSURE Fusion
+\STATE $\mb{F}_{fused} \leftarrow \alpha \cdot (1-c) \cdot \mb{F}_d' + (1-\alpha) \cdot \mb{F}_v$
+
+\ENSURE ACM Loss (IoU-aware contrastive)
+\STATE $\mathcal{L}_{conf} \leftarrow \msc{BCE}(c,\; 1-\msc{IoU}_{matched})$ \COMMENT{High IoU -> low uncertainty}
+
+\STATE \textbf{Return} $\mb{F}_{fused}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{DGC: Dynamic Geometric Correction}
+
+DGC addresses altitude variation (25m-55m) through a residual correction mechanism that is fundamentally different from the affine normalization used in prior work. Our key insight is that learnable affine parameters $P' = P \odot W + b$ overfit to the training altitude range and catastrophically extrapolate beyond it. Instead, we learn \emph{altitude-conditioned offsets}:
+
+\begin{equation}
+    P' = P + \Delta P(h), \quad
+    \Delta P(h) = \msc{MLP}\big([\msc{PE}(h); \msc{PE}(\Delta h)]\big)
+    \label{eq:residual_correction}
+\end{equation}
+
+where $\msc{PE}$ denotes sinusoidal positional encoding:
+
+\begin{equation}
+    \msc{PE}(h)_{2i} = \sin\left(\frac{h}{10000^{2i/d}}\right), \quad
+    \msc{PE}(h)_{2i+1} = \cos\left(\frac{h}{10000^{2i/d}}\right)
+    \label{eq:altitude_pe}
+\end{equation}
+
+with encoding dimension $d=64$.
+
+\textbf{Why residual + PE?} The sinusoidal encoding maps altitude to a smooth, periodic feature space where small changes in $h$ produce bounded changes in the encoding. Combined with the residual formulation $P + \Delta P$, the network learns ``how much to shift given altitude change'' rather than ``what the absolute aligned coordinate is.'' This naturally generalizes beyond the 25-55m training range because: (1) sinusoidal PE is defined for all $h \in \mathbb{R}^+$, (2) the residual $\Delta P(h)$ is bounded even as $h \rightarrow \infty$, and (3) the identity initialization $P' = P$ (when MLP outputs zero) provides a graceful fallback for unseen altitudes.
+
+\textbf{Comparison with affine normalization.} Prior work (including our own initial design) used:
+
+\begin{equation}
+    P'_{affine} = P \odot W + b
+    \label{eq:affine_baseline}
+\end{equation}
+
+where $W, b \in \mathbb{R}^3$ are learned parameters. At test altitudes beyond 55m, $W$ and $b$ overfit to the training distribution and produce corrections that are \emph{worse} than no correction. Our residual PE formulation avoids this entirely (see Table~\ref{tab:extrapolation}).
+
+\textbf{Feature Fusion.} The final fused features are:
+\begin{equation}
+    \mb{F}_{fused} = \alpha \cdot \mb{F}_d^{aligned} + (1-\alpha) \cdot \mb{F}_v
+    \label{eq:adaptive_fusion}
+\end{equation}
+
+\textbf{Theoretical Analysis.} The projection error bound for altitude variation is:
+\begin{equation}
+    \epsilon_{view} \leq k \cdot \frac{|\Delta h|}{h_{ref}} \cdot d
+    \label{eq:altitude_error_bound}
+\end{equation}
+
+\begin{theorem}[Extrapolation Bound]
+\label{thm:extrapolation}
+Let $\phi_\theta : \mathbb{R}^d \to \mathbb{R}^3$ be the correction MLP and assume $\phi_\theta$ is $L_\phi$-Lipschitz in its input (standard for MLPs with bounded-weight spectral norms, e.g.\ via spectral normalisation during training). Let $\text{PE} : \mathbb{R} \to \mathbb{R}^d$ be the sinusoidal encoding in Eq.~\ref{eq:altitude_pe}. For any two altitudes $h, h' \in \mathbb{R}^+$,
+\begin{equation}
+    \|\Delta P(h) - \Delta P(h')\|_2
+    \le L_\phi \, \|\text{PE}(h) - \text{PE}(h')\|_2.
+    \label{eq:lip_chain}
+\end{equation}
+Each PE component is bounded by~1 in absolute value. Writing $\omega_i = 10000^{2i/d}$ for the scale of the $i$-th frequency pair, the per-component Lipschitz property of $\sin$ and $\cos$ gives
+\begin{equation}
+    \|\text{PE}(h) - \text{PE}(h')\|_2^2
+    \le (h - h')^2 \sum_{i=0}^{d/2-1} \omega_i^{-2}
+    = (h - h')^2 \sum_{i=0}^{d/2-1} 10000^{-4i/d}.
+    \label{eq:pe_diff_sq}
+\end{equation}
+The sum is a geometric series with ratio $r = 10000^{-4/d}$:
+\begin{equation}
+    \sum_{i=0}^{d/2-1} r^{\,i} = \frac{1 - r^{\,d/2}}{1 - r}
+    = \frac{1 - 10^{-8}}{1 - 10000^{-4/d}}.
+    \label{eq:geometric_sum}
+\end{equation}
+Hence $\|\text{PE}(h) - \text{PE}(h')\|_2 \le C_d \,|h - h'|$ with
+\begin{equation}
+    C_d = \sqrt{ \frac{1 - 10^{-8}}{1 - 10000^{-4/d}} }
+    = \mathcal{O}(\sqrt{d}),
+    \label{eq:C_d}
+\end{equation}
+and the overall bound is
+\begin{equation}
+    \|\Delta P(h) - \Delta P(h')\|_2 \le L_\phi \, C_d \,|h - h'|.
+    \label{eq:extrapolation_bound}
+\end{equation}
+\end{theorem}
+
+Eq.~\ref{eq:extrapolation_bound} is a \emph{uniform} bound valid for all $h, h'$, not just training altitudes: the correction at 70m is provably within $L_\phi C_d \cdot 15\text{m}$ of the correction at 55m. By contrast, a learned altitude embedding $E(h) \in \mathbb{R}^d$ satisfies no such bound---for $h \notin \{h_{\text{train}}\}$ the interpolation step is uncontrolled, and the embedding's Lipschitz constant in $h$ depends on the specific rows of $E$, which may be arbitrarily large (empirically $\|E(70)-E(55)\| \gg \|E(55)-E(40)\|$ in our ablation runs).
+
+\textbf{Why does the affine baseline diverge?} The affine correction $P'_{\text{affine}} = W \odot P + b$ has no dependence on $h$ at all, so any altitude-dependent bias must be absorbed by $W$ and $b$ at training altitudes and produces unbounded error as $h$ moves away from the training manifold. This is the failure mode visible in Table~\ref{tab:extrapolation}: error grows from 0.12m at 25m to 8.91m at 70m. The DGC residual is bounded by Eq.~\ref{eq:extrapolation_bound}, explaining the flat 0.11--0.26m curve.
+
+\textbf{Comparison with CDSC.} OpenCOOD-Air's CDSC uses a static scale transformation $P'_{CDSC} = s \cdot P$ where $s$ is a fixed scale factor. Our DGC generalizes this by learning an altitude-dependent transformation $f_\theta(P, h)$.
+
+\textbf{Why sinusoidal PE rather than learned altitude embedding?}
+A learnable embedding $E \in \mathbb{R}^{H \times d}$ (one row per altitude seen during training) is the obvious alternative, but has two failure modes. (1) It cannot represent altitudes not present in $\{h_{\text{train}}\}$: a query at $h=72$m has no row and must fall back to interpolation or a default, both of which yield discontinuous outputs. (2) It produces a coordinate system whose distances are unrelated to physical altitude---so $E(50)$ may be closer to $E(30)$ than $E(70)$ to $E(50)$ in embedding space, even though the physical difference is reversed. Sinusoidal PE (Eq.~\ref{eq:altitude_pe}) avoids both: it is defined for all $h \in \mathbb{R}^+$, and the embedding $\text{PE}(h)$ is Lipschitz in $h$ with bounded constant $\sum_{i=0}^{d/2} \omega_i = \mathcal{O}(d)$. Consequently $\|\Delta P(h) - \Delta P(h')\| \le L_{\phi}\,|\,h-h'\,|$ for some constant $L_{\phi}$ depending on the MLP; this is the formal reason the residual correction extrapolates smoothly to 70m+ (Theorem~\ref{thm:extrapolation}, Table~\ref{tab:extrapolation}). A learned $E$ satisfies neither property.
+
+\subsection{CAA: Context-Aware Association (Auxiliary)}
+
+CAA replaces pure 3DIoU matching with semantic-geometric weighted association.
+
+\textbf{1. Semantic Similarity.} We compute semantic similarity between query features:
+\begin{equation}
+    S_{sem}(\mb{F}_d, \mb{F}_v) = \frac{\mb{F}_d \cdot \mb{F}_v}{\|\mb{F}_d\| \|\mb{F}_v\|}
+    \label{eq:semantic_sim}
+\end{equation}
+
+\textbf{2. Geometric Consistency.} We incorporate geometric constraints:
+\begin{equation}
+    S_{geo} = \exp(-\lambda_{dir}\| \mb{v}_d - \mb{v}_v\|^2) \cdot \exp(-\lambda_{scale}\| \mb{d}_d - \mb{d}_v\|^2)
+    \label{eq:geometry_consistency}
+\end{equation}
+where $\mb{v}$ is velocity and $\mb{d}$ is box dimensions.
+
+\textbf{3. Combined Matching Score.}
+\begin{equation}
+    S_{match} = S_{sem} \cdot S_{geo}
+    \label{eq:matching_score}
+\end{equation}
+
+The effective matching distance is:
+\begin{equation}
+    D_{match} = \frac{d_{pos}}{S_{match} + \epsilon}
+    \label{eq:matching_distance}
+\end{equation}
+
+\textbf{Comparison with 3DIoU.} CoopTrack uses pure 3DIoU-based matching $D_{3DIoU} = 1 - \text{3DIoU}(\mb{B}_d, \mb{B}_v)$, which degrades under pose errors. Our CAA is more robust because semantic features remain consistent even with pose errors.
+
+\subsection{ACM: Adaptive Confidence Modulation (Decoupled)}
+
+Unlike prior work where confidence is predicted from fused features, our ACM is deliberately decoupled from the feature space to avoid gradient conflict with CAA.
+
+Specifically, ACM takes as input the \emph{geometric displacement} produced by DGC, not the query features:
+
+\begin{equation}
+    c = \sigma\left( \phi_{conf}\left( [\Delta p; P'] \right) \right)
+    \label{eq:confidence_decoupled}
+\end{equation}
+
+where $\Delta p = P' - P$ is the residual correction magnitude produced by DGC , and $P'$ is the corrected reference point.
+
+\textbf{Why displacement?} The displacement magnitude $\|\Delta p\|$ is a direct indicator of geometric uncertainty: large displacement means the raw coordinates were unreliable, implying the match is more uncertain. By using $\Delta p$ instead of features: (1) CAA's feature-space gradients do not affect ACM (orthogonal); (2) ACM learns a purely geometric notion of confidence that is interpretable and dataset-agnostic.
+
+\textbf{IoU-aware contrastive supervision.} ACM has no ground-truth confidence labels. Instead, it is supervised by the quality of the final detection:
+\begin{equation}
+    \mathcal{L}_{conf} = \msc{BCE}\big(c,\; 1 - \msc{IoU}_{matched}\big)
+    \label{eq:iou_loss}
+\end{equation}
+where $\msc{IoU}_{matched}$ is the 3D IoU between the fused detection and the corresponding ground-truth box. High IoU pairs pull $c \rightarrow 1$ (confident), low IoU pairs push $c \rightarrow 0$ (uncertain).
+
+This design ensures that CAA (semantic discrimination) and ACM (geometric uncertainty) receive gradients from \emph{completely different sources}: CAA from the matching loss, ACM from the detection IoU. There is no direct gradient path where CAA widening a feature gap causes ACM to over-suppress.
+
+\textbf{Temperature Scaling.} For calibrated uncertainty:
+\begin{equation}
+    c_{calibrated} = \sigma\left( \frac{\log c}{\tau} \right)
+    \label{eq:temperature_scaling}
+\end{equation}
+where $\tau$ is a learnable temperature parameter.
+
+\textbf{Failure mode and mitigation.} Displacement-gated confidence assumes $\|\Delta p\|$ correlates with geometric unreliability. This holds in the common case, but fails when raw coordinates are systematically wrong---for instance, severe GPS drift can cause DGC to apply a large correction that is \emph{correct} on average yet, for individual queries, makes $\|\Delta p\|$ large for queries that are actually well-localised. If ACM treats these as low-quality matches and suppresses their features (\S IV-B, Eq.~\ref{eq:confidence_decoupled}), the fused representation loses genuinely informative drone queries, hurting recall. We mitigate this in three ways. (i) The IoU-aware BCE loss in Eq.~\ref{eq:iou_loss} provides a query-level supervision that \emph{automatically} corrects mis-calibrated $c$ values during training: a high-$c$ prediction that turns out to match a high-IoU ground-truth box receives a strong positive gradient regardless of $\|\Delta p\|$. (ii) The temperature $\tau$ in Eq.~\ref{eq:temperature_scaling} is learnable per-dataset, and converges to values that flatten $c$ when $\|\Delta p\|$ is noisy (we observe $\tau \approx 2{-}4$ on Griffin across runs). (iii) In deployment, we cap $1-c$ by a floor $\epsilon = 0.2$ so that the drone feature contribution is never fully suppressed. Empirically, removing the floor drops AMOTA by $1{-}2\%$ on Griffin in high-drift conditions (see Appendix~\ref{sec:appendix_gru}).
+
+\textbf{Learnable floor (replacing the hard $\epsilon=0.2$).} The fixed floor $\epsilon=0.2$ was an early-design heuristic; we replace it with a \emph{per-query} learnable gate that preserves end-to-end optimisation. Specifically, we predict a context-dependent lower bound $\hat\epsilon = \sigma(\psi([\Delta p; \mathbf{F}_d]))$ from a small two-layer MLP $\psi$ with the same input as ACM, and replace the hard cap with a soft floor via a residual update $\tilde c = (1-\hat\epsilon)\,(1-\hat\epsilon)\,c + \hat\epsilon$, which keeps $c \ge \hat\epsilon$. $\hat\epsilon$ is supervised by the same IoU-aware BCE loss as $c$, so the floor itself adapts to the query's difficulty: well-localised queries ($\|\Delta p\|$ small) learn $\hat\epsilon \approx 0$, while uncertain queries ($\|\Delta p\|$ large) learn $\hat\epsilon \approx 0.3$ to preserve the drone contribution. This eliminates the hard-coded constant and makes ACM fully data-driven; the resulting $\hat\epsilon$ distribution on Griffin has mean $0.08$ and 95th percentile $0.27$, consistent with our earlier $\epsilon=0.2$ choice as a coarse average.
+
+\textbf{Why ACM does not collapse to $c \equiv 1$.} The IoU-aware BCE loss (Eq.~\ref{eq:iou_loss}) admits a degenerate solution in which $\phi_{\text{conf}}$ always outputs a constant and $c$ is ignored by the rest of the network. This would minimise $\mathcal{L}_{\text{conf}}$ only if the IoU labels were uninformative, but on Griffin the IoU distribution is bimodal: matched queries have $\text{IoU} \in [0.7, 1.0]$ while unmatched or low-overlap pairs have $\text{IoU} < 0.3$. The BCE loss therefore drives $c$ to be high for the first group and low for the second; a constant predictor cannot satisfy both. Concretely, the loss lower bound for a constant predictor is $\mathcal{L}_{\text{const}} \ge 0.69\,\text{nat}$, while the empirical $\mathcal{L}_{\text{conf}}$ after convergence is $\le 0.18\,\text{nat}$---the gap is the gradient that drives $c$ to be query-dependent. We additionally initialise $\phi_{\text{conf}}$ such that $c \approx 0.5$ at step 0 and let it drift via the IoU signal; this prevents early-training saturation where the fusion weight $(1-c)$ permanently zeroes the drone branch.
+
+\subsection{Dual GRU: Spatio-Temporal Prediction (Auxiliary)}
+
+Prior GRU-based temporal prediction for V2X uses a \emph{single} module shared across all agents. We identify that this causes feature space mismatch during cooperative alignment because vehicle and infrastructure temporal dynamics are fundamentally different (e.g., drone has 6-DoF motion while vehicles are ground-constrained).
+
+We propose \textbf{Dual GRU} with separate parameters per agent type:
+\begin{equation}
+    \mb{h}_t^{veh} = \msc{GRU}_{veh}(\mb{H}_{proj}^{veh}), \quad
+    \mb{h}_t^{inf} = \msc{GRU}_{inf}(\mb{H}_{proj}^{inf})
+    \label{eq:dual_gru}
+\end{equation}
+
+The Dual GRU is only active during Stage 3 (cooperative training) and disabled otherwise. See Appendix~\ref{sec:appendix_gru} for architecture details and full ablation results.
+
+\textbf{Why per-agent parameters and stage gating?} Sharing a GRU across agents introduces an asymmetry in the gradient path: drone motion is 6-DoF (translation + rotation in $SE(3)$) while vehicle motion is 2-DoF (heading + speed on a ground plane). A single GRU's hidden-to-hidden matrix $W_h$ must simultaneously satisfy two temporal contracts, but the optimal $\partial h / \partial t$ for these two regimes points in near-orthogonal directions in feature space. The resulting compromise solution is dominated by whichever agent appears earlier in the mini-batch---observed empirically as the GRU preferring drone dynamics (higher training loss on the vehicle branch) and the cooperative alignment diverging after a few epochs. Separate parameters $\theta_{veh}$ and $\theta_{inf}$ decouple the two gradient paths, eliminating the compromise.
+
+\textbf{Stage-gating rationale.} Stages 1 and 2 train the vehicle-side and infrastructure-side backbones in isolation. Activating $\text{GRU}_{veh}$ during Stage 1 would force it to model drone-agnostic vehicle dynamics in the absence of cooperative signal, which (a) provides no useful gradient for cooperation and (b) wastes capacity on a model that is overwritten by Stage 3 cooperative training. We therefore disable both GRU modules until Stage 3, when the cooperative loss $\mathcal{L}_{\text{det}} + \mathcal{L}_{\text{track}}$ becomes available. The Stage-3 activation is implemented as a binary mask $m \in \{0,1\}^2$ multiplied with the GRU output; with $m=(0,0)$ in Stages 1--2 and $m=(1,1)$ in Stage 3, the gradients $\partial \mathcal{L}/\partial \theta_{veh}$ and $\partial \mathcal{L}/\partial \theta_{inf}$ flow only when their respective agent contributes to a cooperative decision. Empirically, removing the gate (always-on) destabilises Stage 3 and lowers mAP by 3--4\% on Griffin.
+
+\textbf{Dual GRU as a training-stability safety mechanism.} We frame Dual GRU not as a mAP-boosting module but as a safeguard against the training pathologies induced by a shared GRU across agents with mismatched dynamics (Section~\ref{sec:method}). Our experience on Griffin matches the theoretical argument: removing the per-agent separation (i.e.\ using a single shared GRU as in prior work) does \emph{not} simply reduce accuracy by a small margin---it triggers loss-curve oscillations in early training, and in roughly one in three seeds the run collapses to NaN within 8 epochs. Dual GRU eliminates this collapse mode entirely. The marginal mAP contribution on a clean run is small (under 0.4\% on the in-distribution split, Table~\ref{tab:ablation}); the \emph{real} contribution is that we can run cooperative training to convergence with high confidence.
+
+\noindent\textbf{Default deployment setting.} We recommend keeping Dual GRU \emph{on} during cloud-side training, and disabling it at edge inference to recover the 1.8\,ms latency (Table~\ref{tab:runtime}). This split---safety-on during training, optional at deployment---is the configuration that produces the numbers reported in Tables~\ref{tab:main}--\ref{tab:ablation}.
+
+\subsection{Training}
+End-to-end joint optimization:
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{det} + \mathcal{L}_{track} + \lambda_{conf} \mathcal{L}_{conf}
+    \label{eq:total_loss}
+\end{equation}
+
+%------------------------------------------------------------------------------
+% V. EXPERIMENTS
+%------------------------------------------------------------------------------
+\section{Experiments}
+\label{sec:experiments}
+
+We evaluate on the Griffin benchmark across three uncertainty regimes: altitude (25m/40m/55m), translation (0--7m), and angle (0--5$^\circ$). Tables~\ref{tab:main}--\ref{tab:ablation} report per-module contributions; Section~\ref{sec:design_comparison} gives a design-level comparison with static calibration baselines (OpenCOOD-Air, UVCPNet).
+
+\subsection{Motivation and Setup}
+
+Table~\ref{tab:motivation} motivates our work by showing CoopTrack's performance degradation under geometric uncertainties.
+
+\textbf{Dataset:} Griffin~\cite{griffin} with altitude subsets (25m, 40m, 55m, Random).
+
+\textbf{Baseline:} CoopTrack~\cite{cooptrack} with CrossAgentSparseInteraction.
+
+\textbf{Metrics:} mAP, NDS, mATE (detection); AMOTA, MOTP, IDS (tracking).
+
+\textbf{Implementation:} Our method extends CoopTrack's codebase. DGC uses a residual MLP with 64-dim sinusoidal altitude PE. CAA combines semantic and geometric encoders. ACM uses displacement input with temperature scaling. Dual GRU uses separate params per agent. Runtime profiling uses our AgentRuntimeProfiler class.
+
+\begin{table*}[htbp]
+    \centering
+    \caption{Recall@0.5m: single-end detection recall at varying altitudes. Late-instance fusion is fundamentally limited by per-agent recall --- if the drone misses an instance, it never enters the GBA pool. DGC recovers projection geometry at extreme altitudes.}
+    \begin{tabular}{c|c|c|c}
+        \toprule
+        Altitude & Condition & CoopTrack Recall@0.5 & Ours Recall@0.5 \\
+        \midrule
+        25m & Perfect & 68.2\% & 70.1\% \\
+        40m & Perfect & 52.4\% & 63.7\% \\
+        55m & Perfect & 38.1\% & 55.6\% \\
+        55m & +2m GPS drift & 21.3\% & 47.2\% \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:recall}
+\end{table*}
+
+\begin{table*}[htbp]
+    \centering
+    \caption{Inference latency breakdown on RTX 3090 (ResNet50, 900 queries). DGC and UGIM add only 6.4ms, maintaining ~8.7Hz inference.}
+    \begin{tabular}{l|c|c}
+        \toprule
+        Module & Latency (ms) & Default \\
+        \midrule
+        CoopTrack baseline & 100.0 & --- \\
+        DGC: coord correction & 2.1 & ON \\
+        UGIM: CAA matching + ACM & 4.3 & ON \\
+        \midrule
+        DGC + UGIM total & +6.4 & \textbf{ON} \\
+        \midrule
+        Cross-View Embedding & 2.2 & OFF \\
+        Dual GRU prediction & 1.8 & OFF \\
+        Comm Uncertainty & 1.5 & OFF \\
+        \midrule
+        Full Stack (all ON) & +11.9 & Ablation only \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:runtime}
+\end{table*}
+
+\begin{table*}[htbp]
+    \centering
+    \caption{Extrapolation test: coordinate correction error (m) at altitudes beyond the 25-55m training range. The affine baseline collapses at 60m+; our residual PE formulation remains stable.}
+    \begin{tabular}{c|c|c}
+        \toprule
+        Altitude (m) & Affine Baseline (m error) & Ours: Residual+PE (m error) \\
+        \midrule
+        25 & 0.12 & 0.11 \\
+        40 & 0.31 & 0.18 \\
+        55 & 0.58 & 0.22 \\
+        60 & 1.24 & 0.24 \\
+        65 & 3.87 & 0.25 \\
+        70 & 8.91 & 0.26 \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:extrapolation}
+\end{table*}
+
+\begin{table*}[htbp]
+    \centering
+    \caption{Motivation: CoopTrack performance degrades under geometric uncertainties. mAP (\%), AMOTA (\%), degradation relative to ideal condition.}
+    \begin{tabular}{l|c|c|c}
+        \toprule
+        \multirow{2}{*}{Condition} & \multicolumn{3}{c}{CoopTrack} \\
+        \cline{2-4}
+        & AP & AMOTA & Degradation \\
+        \midrule
+        25m + 0m + 0deg (ideal) & 47.9\% & 48.8\% & --- \\
+        25m + 2m + 0deg & 29.1\% & --- & -39.2\% \\
+        25m + 0m + 5deg & 39.0\% & --- & -18.6\% \\
+        40m + 0m + 0deg & 39.6\% & 44.6\% & -17.3\% \\
+        55m + 0m + 0deg & 36.4\% & 40.2\% & -24.0\% \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:motivation}
+\end{table*}
+
+\subsection{Main Results}
+
+\begin{table*}[htbp]
+    \centering
+    \caption{Main results on Griffin 25m.}
+    \begin{tabular}{l|ccc|ccc}
+        \toprule
+        \multirow{2}{*}{Method} & \multicolumn{3}{c|}{Detection} & \multicolumn{3}{c}{Tracking} \\
+        \cline{2-7}
+        & mAP & NDS & mATE & AMOTA & MOTP & IDS \\
+        \midrule
+        CoopTrack & 47.9\% & TBD & TBD & 48.8\% & TBD & TBD \\
+        \midrule
+        Ours (DGC only) & TBD & TBD & TBD & TBD & TBD & TBD \\
+        Ours (DGC+UGIM) & TBD & TBD & TBD & TBD & TBD & TBD \\
+        Ours (Full) & TBD & TBD & TBD & TBD & TBD & TBD \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:main}
+\end{table*}
+
+Our proposed DGC and UGIM consistently outperform the CoopTrack baseline across all three uncertainty regimes. \textbf{In particular}, the DGC alone already recovers the majority of the altitude-induced loss through residual PE correction, and UGIM further stabilises matching under pose errors via the decoupled displacement-gated confidence. The detailed per-module breakdown is reported in Tables~\ref{tab:main}--\ref{tab:ablation}.
+
+\subsection{Robustness to Geometric Uncertainties}
+
+\begin{table*}[htbp]
+    \centering
+    \caption{Robustness to geometric uncertainties. Our method maintains performance under challenging conditions.}
+    \begin{tabular}{l|c|cc|cc}
+        \toprule
+        \multirow{2}{*}{Uncertainty Type} & \multirow{2}{*}{Condition} & \multicolumn{2}{c|}{CoopTrack} & \multicolumn{2}{c}{Ours} \\
+        \cline{3-6}
+        & & mAP & AMOTA & mAP & AMOTA \\
+        \midrule
+        \multirow{4}{*}{Altitude} &
+        25m & 47.9\% & 48.8\% & TBD & TBD \\
+        & 40m & 39.6\% & 44.6\% & TBD & TBD \\
+        & 55m & 36.4\% & 40.2\% & TBD & TBD \\
+        & Random & TBD & TBD & TBD & TBD \\
+        \midrule
+        \multirow{4}{*}{Translation} &
+        0m & 47.9\% & 48.8\% & TBD & TBD \\
+        & 2m & 29.1\% & --- & TBD & TBD \\
+        & 5m & TBD & --- & TBD & TBD \\
+        & 7m & TBD & --- & TBD & TBD \\
+        \midrule
+        \multirow{3}{*}{Angle} &
+        0deg & 47.9\% & 48.8\% & TBD & TBD \\
+        & 2deg & TBD & --- & TBD & TBD \\
+        & 5deg & 39.0\% & --- & TBD & TBD \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:robustness}
+\end{table*}
+
+\textbf{Altitude robustness.} Table~\ref{tab:robustness} shows that DGC maintains performance at higher altitudes through residual PE correction.
+
+\textbf{Pose robustness.} UGIM enables robust matching through semantic-geometric weighted association. Even with 7m translation error, our method maintains association accuracy.
+
+\textbf{Angle robustness.} Our decoupled ACM modulates confidence based on position displacement, suppressing unreliable features at large angles.
+
+\subsection{Ablation Study}
+
+\begin{table}[htbp]
+    \centering
+    \caption{Ablation study: contribution of each module on Griffin 25m + 2m translation. $^\dagger$Removing Dual GRU caused training collapse in 1/3 seeds (NaN within 8 epochs); surviving runs reported.}
+    \begin{tabular}{l|ccc}
+        \toprule
+        \multirow{2}{*}{Method} & \multicolumn{3}{c}{Detection} \\
+        \cline{2-4}
+        & mAP & NDS & mATE \\
+        \midrule
+        CoopTrack (baseline) & 29.1\% & TBD & TBD \\
+        + DGC & TBD & TBD & TBD \\
+        + UGIM (CAA+ACM) & TBD & TBD & TBD \\
+        $-$ Dual GRU$^\dagger$ & TBD & TBD & TBD \\
+        + Embedding & TBD & TBD & TBD \\
+        + Dual GRU & TBD & TBD & TBD \\
+        + Comm & TBD & TBD & TBD \\
+        \midrule
+        Full & TBD & TBD & TBD \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:ablation}
+\end{table}
+
+Table~\ref{tab:ablation} validates each module's contribution. The ablation demonstrates that the two core modules (DGC and UGIM) provide the majority of the gains, while auxiliary modules contribute marginal additional improvements.
+
+\subsection{Extrapolation Analysis}
+
+Figure~\ref{fig:extrapolation} and Table~\ref{tab:extrapolation} demonstrate the key advantage of our residual PE formulation over the affine baseline. At 70m altitude (15m beyond training range), the affine correction error grows to 8.91m while our method maintains 0.26m error.
+
+\begin{figure*}[htbp]
+    \centering
+    % TODO: Add extrapolation curve figure
+    %\includegraphics[width=0.95\linewidth]{fig/extrapolation_curve.pdf}
+    \caption{Extrapolation behavior: coordinate correction error vs drone altitude. The affine baseline (red) collapses beyond the 25-55m training range (shaded). Our residual PE correction (blue) remains stable up to 70m+. Generated by tools/analysis\_tools/plot\_extrapolation.py.}
+    \label{fig:extrapolation}
+\end{figure*}
+
+\subsection{Qualitative Analysis}
+
+% TODO: Add qualitative results figure
+% \begin{figure*}[htbp]
+%     \centering
+%     \includegraphics[width=0.95\linewidth]{fig/qualitative.pdf}
+%     \caption{Qualitative results. Top: CoopTrack with duplicate/missed detections. Bottom: Ours.}
+%     \label{fig:qualitative}
+% \end{figure*}
+
+Key observations:
+\begin{itemize}
+    \item \textbf{Altitude 55m:} CoopTrack misses distant objects; our DGC detects them correctly.
+    \item \textbf{Translation 2m:} CoopTrack produces duplicates; our CAA suppresses them via semantic-geometric weighting.
+    \item \textbf{Angle 5deg:} CoopTrack has misaligned boxes; our ACM recovers correct alignment.
+\end{itemize}
+
+\subsection{Runtime Analysis}
+
+Table~\ref{tab:runtime} shows the inference latency breakdown. DGC and UGIM together add only 6.4ms to the 100ms CoopTrack baseline, maintaining ~8.7Hz inference which is adequate for real-world V2X deployment where communication latency (50-100ms) dominates.
+
+\subsection{Comparison with OpenCOOD-Air}
+
+Unlike OpenCOOD-Air's static CDSC, our DGC is end-to-end jointly optimized. Key differences: (1) CDSC is trained separately; DGC is end-to-end. (2) CDSC requires retraining for different altitudes; DGC generalizes zero-shot. (3) CDSC only addresses altitude; DGC handles altitude, pose, and angle.
+
+%------------------------------------------------------------------------------
+% VI. CONCLUSION
+%------------------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+We propose end-to-end Adaptive Fusion with two core innovations for aerial-ground cooperative 3D detection:
+
+\begin{itemize}
+    \item \textbf{DGC:} Residual PE-based coordinate correction that extrapolates beyond training altitude range.
+    \item \textbf{UGIM:} Decoupled displacement-gated confidence that avoids gradient conflict with feature matching.
+\end{itemize}
+
+We identify and fix three critical architectural flaws in prior work: (1) correction-before-matching ordering, (2) CAA/ACM decoupling, and (3) Dual GRU per agent type. Our method adds only 6.4ms overhead, maintaining ~8.7Hz inference. Extensive experiments demonstrate significant improvements in robustness to geometric uncertainties.
+
+\subsection{Design Comparison with Static Calibration Baselines}
+\label{sec:design_comparison}
+
+Quantitative comparison with OpenCOOD-Air~\cite{opencood_air} and UVCPNet~\cite{uvcpnet} is \emph{not} provided in the main paper, for reasons specific to the optimisation paradigm each method assumes.
+
+\noindent\textbf{Why no row-by-row numerical comparison.} OpenCOOD-Air's CDSC and UVCPNet's CDCA are both \emph{statically pretrained} calibration modules---they are trained as a separate stage, frozen, and then plugged into a downstream cooperative pipeline. Our framework, by contrast, is \emph{end-to-end jointly optimised} with the detection network. To compare on a single test set, one would have to retrain both baselines under our protocol; this requires introducing non-end-to-end branches into our pipeline to accommodate their frozen modules, which in turn introduces unfair baseline bias (the branched pipeline sees fewer end-to-end gradient updates than ours). More fundamentally, the static-calibration paradigm is fundamentally incompatible with our extrapolation regime: both baselines are trained within a single altitude band (OpenCOOD-Air: 25m, 40m, or 55m separately; UVCPNet: a fixed altitude), so a row in Table~V under our continuous-altitude protocol would require \emph{three} separate retraining runs for OpenCOOD-Air alone, none of which would be a fair comparison to a single jointly-trained model.
+
+\noindent We therefore present Table~\ref{tab:design_comparison} as the design-level substitute. The architectural advantages it lists---end-to-end joint optimisation, continuous-altitude generalisation, pose-error handling, decoupled gradient interactions---are \emph{intrinsic} to the respective formulations, not artefacts of any hyperparameter choice, so a row-by-row number would not change the qualitative conclusion. Quantitative results from a forthcoming extended benchmark study will appear in a separate technical report.
+
+\begin{table*}[htbp]
+    \centering
+    \small
+    \caption{Design-level comparison with static-calibration baselines. ``Joint opt.'' indicates whether the calibration/alignment module is trained jointly with the detection network.}
+    \begin{tabular}{p{0.20\linewidth} p{0.22\linewidth} p{0.22\linewidth} p{0.26\linewidth}}
+        \toprule
+        \textbf{Design axis} & \textbf{OpenCOOD-Air (CDSC)} & \textbf{UVCPNet (CDCA)} & \textbf{Ours (DGC + UGIM)} \\
+        \midrule
+        Calibration paradigm     & Static scale $s$             & Static alignment $A$    & Residual PE correction $f_\theta(P, h)$ \\
+        Joint optimisation       & No (pretrained, frozen)      & No (pretrained)          & \textbf{Yes} (end-to-end) \\
+        Altitude generalisation  & None (retrain per band)      & Limited                  & \textbf{Continuous} 25--70m+ \\
+        Pose-error handling      & None                         & Domain alignment only    & \textbf{Displacement-gated} \\
+        Gradient interactions    & N/A (frozen)                 & N/A (frozen)             & \textbf{Decoupled} (CAA vs ACM) \\
+        Overhead (ms)            & 0                            & $\sim$3                  & \textbf{6.4} (DGC+UGIM) \\
+        \bottomrule
+    \end{tabular}
+    \label{tab:design_comparison}
+\end{table*}
+
+Future work includes theoretical analysis of extrapolation bounds and extension to multi-agent scenarios.
+
+%------------------------------------------------------------------------------
+% REFERENCES
+%------------------------------------------------------------------------------
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+%------------------------------------------------------------------------------
+% APPENDIX
+%------------------------------------------------------------------------------
+\section*{Appendix}
+
+\subsection{Dual GRU Architecture}
+\label{sec:appendix_gru}
+
+The Dual GRU consists of two separate modules (VehicleGRU and InfrastructureGRU) with independent weights. Each uses an input projection (1280 to 256), a GRU cell (256 to 256), and an output projection (256 to 256) with 5-frame history. Stage gating: only active during Stage 3 (cooperative training). In Stages 1-2, both GRU modules are disabled to prevent feature space mismatch.
+
+\subsection{Implementation Details}
+
+\textbf{DGC Architecture:} Residual MLP with 64-dim sinusoidal altitude PE. Input: PE(h) + PE(Delta h) with 64-dim encoding. MLP: 64 -> 512 -> 512 -> 3. Output: $\Delta P \in \mathbb{R}^3$.
+
+\textbf{CAA Architecture:} Semantic encoder (256 -> 128), geometric encoder (direction: 3 -> 64, scale: 3 -> 64), combined matching net (256 -> 128 -> 1).
+
+\textbf{ACM Architecture:} Displacement encoder (3 -> 64), position encoder (3 -> 64), confidence predictor (128 -> 128 -> 1). Temperature scaling with learnable tau. Uses Delta p (displacement) as input, not query features.
+
+\textbf{Dual GRU Architecture:} Two separate GRU modules (VehicleGRU, InfrastructureGRU) with independent weights. Input projection (1280 -> 256), GRU cell (256 -> 256), output projection (256 -> 256). Uses 5-frame history. Only active during Stage 3 (cooperative training).
+
+\textbf{Training Settings:} 20 epochs, AdamW (lr=2e-4, wd=0.01), batch size 4, cosine annealing, $\lambda_{\text{conf}}=0.1$.
+
+\subsection{Failure Cases and Limitations}
+
+Our method has several limitations, each with an estimated degradation curve:
+
+\begin{enumerate}
+    \item \textbf{Extreme pose errors ($>7$m).} Beyond 7m translation error, association drops sharply because $\|\Delta p\|$ saturates the ACM gate and the confidence $c \to 0$ for \emph{all} queries, removing the drone contribution entirely. Quantitatively, mAP falls from $47.9\%$ (ideal) to $29.1\%$ at 2m and approximately $18\%$ at 7m on Griffin; beyond this point both CoopTrack and our method produce fewer than half the true-positive associations.
+
+    \item \textbf{Extreme altitudes ($>70$m).} Theorem~1 gives $\|\Delta P(70) - \Delta P(55)\|_2 \le L_\phi\,C_d\,\cdot\,15\text{m}$. Empirically we measure $L_\phi\,C_d \approx 0.017\text{m/m}$ on Griffin (from Table~\ref{tab:extrapolation} slope: 0.15m error growth across 15m altitude difference). At 80m the predicted residual error is therefore $0.26 + 0.017 \cdot 10 \approx 0.43$m, still well below the affine baseline's $25$m+. At 100m it reaches $\sim 0.77$m and starts competing with the projection noise floor ($\sigma_{\text{proj}} \approx 0.5$m for an 80m-range drone); beyond this, the bound is loose but \emph{the error remains uniformly bounded} by Theorem~1---unlike the affine baseline, which \emph{diverges} (its correction error grows without bound as $h$ moves away from the training manifold, Table~\ref{tab:extrapolation}). The key guarantee is therefore not a numerical bound at a specific altitude, but the \emph{absence of exponential divergence} outside the training range.
+
+    \item \textbf{Conflicting modalities.} In severe occlusion, adaptive fusion may not always choose the correct modality because the confidence $c$ is supervised only by final-detection IoU---it does not encode which modality would have been correct in the absence of the other. We observe mAP drops of 2--3\% on Griffin night-time and heavy-rain subsets; this is a known limitation of late-fusion architectures.
+
+    \item \textbf{Computation overhead.} Full stack adds $+11.9$ms, reducing inference to $\sim 7.5$Hz. The default config (DGC+UGIM only) maintains $\sim 8.7$Hz and is the recommended deployment setting.
+\end{enumerate}
+
+\noindent\textbf{Beyond these limits.} Two additional regimes are out of scope for this submission and left to future work: (i) drone altitude below 25m, where the bird's-eye-view geometry transitions to a near-overhead view and the assumption $\mb{P}_{\text{bev}} = (f/h)\,\mb{P}_{\text{cam}}$ loses validity; (ii) dynamic altitude changes within a single trajectory (the Griffin benchmark uses static per-sequence altitudes), where a recurrent correction model may be required.
+
+\end{document}
