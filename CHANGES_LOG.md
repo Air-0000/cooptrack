@@ -141,7 +141,14 @@
 - `docs/` —— INSTALL / DATA_PREP / TRAIN_EVAL / PROJECT_SUMMARY
 - `CLAUDE.md`、`CHANGES_LOG.md` —— 命名映射与改动流水
 
-### ⚠️ 待你确认
+### ✅ 已完成（2026-09-22）
 
-稿件目前位于**公开**仓库。合并完成后论文应只保留在**私有**仓库中，公开仓库需要移除
-`adaptive_fusion.tex` / `adaptive_fusion.pdf` / `references.bib`。
+- 完整的「论文 + 代码」已推送到**私有**仓库 `Aerial-Ground-Cooperative-Perception`
+  （`6abaa02..cc9aba0`，136 个文件变更，125 新增 / 0 删除）。
+- 公开仓库 `cooptrack` 已移除 `adaptive_fusion.tex`、`adaptive_fusion.pdf`、`references.bib`
+  以及 `PROJECT_SUMMARY.md`、`docs/PROJECT_SUMMARY.md`、`fix_paper.py`（`bbe30d4..f1acca0`），
+  并恢复为代码仓库版 README —— 仅保留 CoopTrack 基座 + DGC/UGIM 插件代码。
+- 论文稿件现在**只存在于私有仓库**中。
+
+> 后续论文修改请在私有仓库 `Aerial-Ground-Cooperative-Perception` 的工作副本中进行；
+> 本仓库（公开）只维护插件代码。
