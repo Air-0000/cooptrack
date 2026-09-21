@@ -2,7 +2,7 @@
 
 > 记录日期：2026-09-22
 > 涉及文件：`projects/mmdet3d_plugin/cooptrack/modules/` 下 3 个模块
-> 本仓库 **不是 git 仓库**，无法用 `git diff` 回溯，故以此文件为准记录全部改动。
+> 本仓库已接入 git。此文件保留为改动流水与决策记录。
 
 ---
 
@@ -109,3 +109,39 @@
 6. **回填论文**：把 `PROJECT_SUMMARY.md` 里的 TBD 值与消融表填实；补框架图。
 
 > 提示：重新验证时可用同样的冒烟套路（`importlib` 加载 + `Instances` stub + 构造 `veh2inf_rt` 使 `inv(rt.T)[:3,3]` = 目标高度），不需要完整数据集即可跑通前向。
+
+---
+
+## 六、仓库合并（2026-09-22）：代码 + 论文 → 单一论文仓库
+
+此前工作分散在两个仓库，本次合并为**一个论文仓库**：
+
+| 仓库 | 原角色 | 文件数 | 归属 |
+|---|---|---|---|
+| `Aerial-Ground-Cooperative-Perception`（私有） | 论文专属：tex/pdf、插件模块、文档 | 23 | 论文侧 |
+| `cooptrack`（公开） | CoopTrack 官方完整代码库 + 插件 | 145 | 代码侧 |
+
+### 合并动作
+
+1. **并入 AGC 独有的 2 个文件**（本地此前没有）：
+   - `CLAUDE.md` → 重写为「模块 ↔ 论文命名映射」（AAF/UAF/GAF → DGC/UGIM），并写明三条不可破坏的约束。
+   - `docs/PROJECT_SUMMARY.md` → 中文项目纪要，命名对齐 DGC/UGIM，时间线更新。
+2. **README 二合一**：
+   - AGC 版（338 行，论文视角：Overview / 两大贡献 / 三个致命修复 / 死区防御 / 性能表 / 架构 / 消融 / 图表）
+   - cooptrack 版（122 行，基座视角：CoopTrack 署名 / 三阶段配置 / 实验编排 / Related Works）
+   - 合并后以**论文为主、代码为附**，同时保留 CoopTrack 的署名、News、Contact、Citation 与 Related Works，明确「基座来自 CoopTrack，本仓库贡献是 DGC+UGIM 插件」。
+3. 论文（`adaptive_fusion.tex` 857 行）与代码（含 16 处修复 + σ 预测头）均取最新状态。
+
+### 合并后的仓库定位
+
+- `adaptive_fusion.tex` / `.pdf` / `references.bib` —— 未发表稿件
+- `projects/mmdet3d_plugin/cooptrack/modules/` —— DGC / UGIM / 辅助模块
+- `projects/configs_spd_{veh,inf,coop}/` —— 三阶段训练配置
+- `tools/` —— 实验编排、绘图、profiling
+- `docs/` —— INSTALL / DATA_PREP / TRAIN_EVAL / PROJECT_SUMMARY
+- `CLAUDE.md`、`CHANGES_LOG.md` —— 命名映射与改动流水
+
+### ⚠️ 待你确认
+
+稿件目前位于**公开**仓库。合并完成后论文应只保留在**私有**仓库中，公开仓库需要移除
+`adaptive_fusion.tex` / `adaptive_fusion.pdf` / `references.bib`。
