@@ -99,7 +99,10 @@ def main():
         # ── NEW: Residual PE correction ──
         if aaf_module is not None and hasattr(aaf_module, '_residual_correction'):
             with torch.no_grad():
-                corrected_new, _ = aaf_module._residual_correction(distorted)
+                # `alt` is the drone flight altitude — a per-frame scalar, no longer
+                # read off the z coordinate of the point being corrected.
+                alt_t = torch.full((distorted.shape[0], 1), float(alt))
+                corrected_new, _, _ = aaf_module._residual_correction(distorted, alt_t)
             err_new = compute_correction_error(corrected_new, gt_center)
         else:
             err_new = err_old * 0.3  # simulated improvement

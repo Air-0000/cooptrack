@@ -47,13 +47,24 @@ class AAF(nn.Module):
 
         # 2. Residual correction MLP (replaces old remap_mlp + affine_W/b)
         # P' = P + ΔP(h), ΔP = MLP(PE(h) + PE(Δh))
+        #
+        # Output is R^4, not R^3:
+        #   [0:3] translation residual ΔP ∈ R^3
+        #   [3]   log-scale s along the line of sight (drone optical centre → point)
+        #
+        # The 4th DOF is the learnable replacement for the hand-crafted
+        # `refine_ratio` that the released Griffin codebase ships DISABLED:
+        #     ray = P - drone_pos;  P' = drone_pos + ray * refine_ratio
+        # A fixed/analytic ratio cannot express altitude-dependent behaviour, so
+        # we predict log s from PE(h) instead. exp(s) keeps the scale positive and
+        # s = 0 is the identity, preserving DGC's graceful fallback for unseen h.
         self.residual_mlp = nn.Sequential(
             nn.Linear(self.pe_dim, hidden_dim),
             nn.ReLU(inplace=True),
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 3),
+            nn.Linear(hidden_dim, 4),
         )
 
         # 3. Dynamic fusion weight network
@@ -93,15 +104,40 @@ class AAF(nn.Module):
         pe = torch.cat([pe, pe], dim=-1)
         return pe
 
-    def _residual_correction(self, ref_pts_veh):
-        altitude = ref_pts_veh[..., 2:3]
+    def _residual_correction(self, ref_pts_veh, drone_pos, altitude):
+        """
+        Altitude-conditioned residual correction with the 4th DOF.
+
+        Args:
+            ref_pts_veh: [N, 3] drone reference points in the ego-vehicle frame
+            drone_pos:   [3]    drone optical centre in the ego-vehicle frame
+                                (calib_inf2veh[:3, 3])
+            altitude:    [N, 1] flight altitude h — a per-FRAME scalar broadcast to
+                                N queries. This is drone_pos[2], NOT the z coordinate
+                                of a reference point (that is the object's height,
+                                ~0 for ground objects).
+
+        Returns:
+            corrected_pts: [N, 3]
+            delta_p:       [N, 3] translation residual
+            log_scale:     [N, 1] line-of-sight log-scale
+        """
         height_diff = altitude - self.h_ref
         pe_h = self._alt_pe(altitude)
         pe_dh = self._alt_pe(height_diff)
         pe_input = pe_h + pe_dh
-        delta_p = self.residual_mlp(pe_input)
-        corrected_pts = ref_pts_veh + delta_p
-        return corrected_pts, delta_p
+        delta = self.residual_mlp(pe_input)
+
+        delta_p = delta[..., :3]
+        log_scale = delta[..., 3:4].clamp(-0.5, 0.5)
+
+        # Line-of-sight scaling about the drone optical centre. This is the
+        # learnable stand-in for Griffin's disabled analytic `refine_ratio`.
+        drone_pos = drone_pos.reshape(1, 3)
+        ray = ref_pts_veh - drone_pos
+        corrected_pts = drone_pos + ray * torch.exp(log_scale) + delta_p
+
+        return corrected_pts, delta_p, log_scale
 
     def _loc_norm(self, locs, pc_range):
         """Normalize locations to [0, 1] range."""
@@ -144,13 +180,25 @@ class AAF(nn.Module):
         # Step 1: Coordinate transformation inf→vehicle
         inf_ref_pts = self._loc_denorm(inf_instances.ref_pts, inf_pc_range)
         calib = np.linalg.inv(veh2inf_rt.cpu().numpy().T)
-        calib = torch.from_numpy(calib).to(device)
+        calib = torch.from_numpy(calib).to(device=device, dtype=inf_ref_pts.dtype)
         inf_ref_pts_h = torch.cat([inf_ref_pts, torch.ones_like(inf_ref_pts[..., :1])], dim=-1).unsqueeze(-1)
         inf_ref_pts_veh = torch.matmul(calib, inf_ref_pts_h).squeeze(-1)[..., :3]
 
-        # Step 2: Extrapolation-robust residual correction
-        # P' = P + ΔP(h),   ΔP(h) = MLP(PE(h) + PE(Δh))
-        inf_ref_pts_corrected, _ = self._residual_correction(inf_ref_pts_veh)
+        # Step 1b: flight altitude.
+        # h is the DRONE's height in the ego-vehicle frame — one scalar per frame.
+        # Using ref_pts_veh[..., 2] here would be wrong: that is the object's
+        # height above the ground plane (~0), which carries no altitude signal and
+        # would make PE(h) depend on what is being detected rather than on where
+        # the drone is flying.
+        drone_pos = calib[:3, 3].detach()                       # [3]
+        altitude = drone_pos[2].reshape(1, 1).expand(inf_n, 1)  # [N, 1]
+
+        # Step 2: Extrapolation-robust residual correction (ΔP ∈ R^4)
+        # P' = drone_pos + (P - drone_pos)·exp(s) + ΔP,
+        #      [ΔP; s] = MLP(PE(h) + PE(Δh))
+        inf_ref_pts_corrected, delta_p, log_scale = self._residual_correction(
+            inf_ref_pts_veh, drone_pos, altitude
+        )
         inf_ref_pts_norm = self._loc_norm(inf_ref_pts_corrected, pc_range)
 
         # Step 3: Cross-agent feature alignment
@@ -160,24 +208,27 @@ class AAF(nn.Module):
         )
 
         # Step 4: Dynamic height-weighted feature fusion
-        altitude = inf_ref_pts_veh[..., 2:3]
+        # (altitude already defined in Step 1b as the per-frame flight height)
         h_diff = altitude - self.h_ref  # deviation from reference altitude
-        h_diff_expanded = h_diff.expand(-1, self.embed_dims)
+        # fusion_weight_net's first layer is Linear(embed_dims + 3, ...), so the
+        # altitude deviation must occupy 3 slots. Expanding it to embed_dims
+        # produced a 512-wide concat against a 259-wide layer.
+        h_diff_expanded = h_diff.expand(-1, 3)
         feat_concat = torch.cat([inf_instances.query_feats, h_diff_expanded], dim=-1)
         height_weight = self.fusion_weight_net(feat_concat).squeeze(-1)  # [N]
 
-        # Step 5: Feature fusion (simplified, without uncertainty)
-        fused_feats_list = []
-        for i in range(inf_n):
-            w = height_weight[i].unsqueeze(-1)
-            fused = self.fusion_mlp(
-                torch.cat([veh_instances.query_feats * (1 - w), inf_query_aligned[i] * w], dim=-1)
-            )
-            fused_feats_list.append(fused)
-
-        fused_feats = torch.stack(fused_feats_list, dim=0)
-
-        return fused_feats, height_weight, inf_ref_pts_norm
+        # Step 5: return ALIGNED inf features — not fused ones.
+        # Fusion belongs to the caller: AdaptiveFusion matches inf↔veh queries
+        # first and only then fuses the matched pairs. The old loop fused every
+        # inf query against ALL veh queries, producing [N, M, D], which broke
+        # `aaf_feats[matched_inf_idx]` downstream (and crashed on the 2-D/1-D
+        # concat when veh_n == 1).
+        #
+        # altitude and delta_p are returned because ACM needs them:
+        #   altitude → the σ ∝ h prior
+        #   delta_p  → ACM's geometric (feature-free) input, keeping the
+        #              confidence branch gradient-orthogonal to CAA
+        return inf_query_aligned, height_weight, inf_ref_pts_norm, altitude, delta_p
 
 
 # ============================================================================
@@ -205,9 +256,13 @@ class CAA(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Direction encoder (from motion features or bbox velocity)
+        # Direction encoder (from bbox velocity).
+        # pred_boxes is CoopTrack's 10-D code:
+        #   [0:3] centre xyz | [3:6] dims wlh | [6:8] sin/cos yaw | [8:10] vel vx,vy
+        # so velocity is 2-D (vx, vy), matching spatial_temporal_reason.py.
+        # It was previously declared Linear(3, ...) and blew up at runtime.
         self.direction_encoder = nn.Sequential(
-            nn.Linear(3, embed_dims // 4),
+            nn.Linear(2, embed_dims // 4),
             nn.ReLU(inplace=True),
         )
 
@@ -217,9 +272,12 @@ class CAA(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Combined matching score
+        # Combined matching score.
+        # Its input is cat(dir_encoded, scale_encoded) = embed_dims//4 * 2 =
+        # embed_dims//2, NOT embed_dims. The old Linear(embed_dims, ...) expected
+        # 256 and crashed on the 128-wide concat.
         self.matching_net = nn.Sequential(
-            nn.Linear(embed_dims, embed_dims // 2),
+            nn.Linear(embed_dims // 2, embed_dims // 2),
             nn.ReLU(inplace=True),
             nn.Linear(embed_dims // 2, 1),
         )
@@ -252,7 +310,7 @@ class CAA(nn.Module):
             geo_score: geometric consistency scores
         """
         # Extract velocity direction
-        velocity = pred_boxes[..., 8:11]  # [N, 3]
+        velocity = pred_boxes[..., 8:10]  # [N, 2] vx, vy — see layout note above
         dir_encoded = self.direction_encoder(velocity)
 
         # Extract scale (dimensions)
@@ -296,12 +354,18 @@ class CAA(nn.Module):
         veh_geo = self.compute_geometry_score(veh_pts, veh_boxes)  # [M, 1]
 
         # Geometric score for pairs (combination of direction + scale consistency)
-        inf_geo_exp = inf_geo.unsqueeze(1).expand(inf_n, veh_n)
-        veh_geo_exp = veh_geo.unsqueeze(0).expand(inf_n, veh_n)
-        geometry_score = (inf_geo_exp + veh_geo_exp) / 2
+        # inf_geo / veh_geo are [N, 1] and [M, 1]: broadcast straight to [N, M].
+        # The old `.unsqueeze(1)` / `.unsqueeze(0)` produced [N,1,1] / [1,M,1],
+        # which made expand() raise. Info: veh_geo needs a transpose to [1, M].
+        inf_geo_exp = inf_geo.expand(inf_n, veh_n)          # [N, 1] -> [N, M]
+        veh_geo_exp = veh_geo.T.expand(inf_n, veh_n)        # [M, 1] -> [1, M] -> [N, M]
+        geometry_score = (inf_geo_exp + veh_geo_exp) / 2    # [N, M]
 
-        # Combined matching score: semantic + geometric
-        matching_scores = semantic_sim * geometry_score.squeeze(-1)
+        # Combined matching score: semantic + geometric.
+        # NOTE: no squeeze(-1) here — geometry_score is genuinely 2-D [N, M] and
+        # squeezing it collapsed the score matrix to [N], silently breaking the
+        # element-wise product with semantic_sim.
+        matching_scores = semantic_sim * geometry_score     # [N, M]
 
         return matching_scores
 
@@ -321,8 +385,10 @@ class ACM(nn.Module):
     Integrates with AAF and CAA for robust fusion.
     """
 
-    def __init__(self, embed_dims=256, hidden_dim=128):
+    def __init__(self, embed_dims=256, hidden_dim=128, h_ref=25.0, sigma_min=0.1):
         super(ACM, self).__init__()
+        self.h_ref = h_ref
+        self.sigma_min = sigma_min
 
         # Displacement encoder (Δp: AAF-corrected - raw coordinate)
         # Takes 3D displacement vector → hidden representation
@@ -340,10 +406,28 @@ class ACM(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Confidence predictor (from displacement + position only)
-        self.confidence_net = nn.Sequential(
+        # Altitude encoder — h is what drives the first-order trend σ ∝ h.
+        self.alt_encoder = nn.Sequential(
+            nn.Linear(1, hidden_dim // 4),
+            nn.ReLU(inplace=True),
+        )
+
+        self.input_proj = nn.Sequential(
+            nn.Linear(2 * (hidden_dim // 2) + hidden_dim // 4, hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+
+        self.trunk = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
+        )
+
+        # σ head: predicts the DEVIATION from the analytic σ ∝ h trend, not the
+        # trend itself. See forward().
+        self.sigma_head = nn.Linear(hidden_dim, 1)
+
+        # Confidence predictor (from displacement + position only)
+        self.confidence_net = nn.Sequential(
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid(),  # Output in [0, 1]
         )
@@ -360,30 +444,45 @@ class ACM(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, displacement, ref_pts):
+    def forward(self, displacement, ref_pts, altitude):
         """
-        ACM forward pass for confidence prediction.
+        ACM forward pass.
 
-        Uses AAF coordinate displacement (Δp) as input instead of fused features,
-        decoupling ACM from CAA.
+        Uses the DGC displacement (Δp) and the flight altitude h as inputs instead
+        of fused features, keeping the confidence branch gradient-orthogonal to CAA.
 
         Args:
-            displacement: [N, 3] AAF displacement = corrected_pts - raw_pts
-            ref_pts: [N, 3] reference points (for height-dependent calibration)
+            displacement: [N, 3] DGC displacement = corrected_pts - raw_pts
+            ref_pts:      [N, 3] corrected reference points (position context)
+            altitude:     [N, 1] flight altitude h (per-frame scalar broadcast to N)
 
         Returns:
+            sigma:      [N, 1] per-query estimate, in metres, of the BEV
+                               localisation error that SURVIVES DGC correction
             confidence: [N, 1] confidence scores in (0, 1)
         """
         disp_encoded = self.disp_encoder(displacement)  # [N, hidden_dim/2]
         pos_encoded = self.pos_encoder(ref_pts)          # [N, hidden_dim/2]
+        alt_encoded = self.alt_encoder(altitude)         # [N, hidden_dim/4]
 
-        combined = torch.cat([disp_encoded, pos_encoded], dim=-1)  # [N, hidden_dim]
+        combined = torch.cat([disp_encoded, pos_encoded, alt_encoded], dim=-1)
+        feat = self.trunk(self.input_proj(combined))     # [N, hidden_dim]
+
+        # ---- σ: analytic first-order trend + learned deviation ----------------
+        # Under the pinhole model the BEV localisation error grows approximately
+        # linearly with altitude (σ_pos ∝ h). That trend carries NO learned
+        # parameters; the network only learns the multiplicative deviation from it.
+        # This is what keeps the head data-efficient and lets the tolerance
+        # extrapolate to altitudes outside the training range.
+        deviation = F.softplus(self.sigma_head(feat))            # > 0
+        h_ratio = (altitude / self.h_ref).clamp(min=1e-3)
+        sigma = self.sigma_min + deviation * h_ratio             # [N, 1], metres
 
         # Temperature scaling for calibration
         temperature = torch.exp(self.log_temperature)
-        confidence = self.confidence_net(combined) * temperature
+        confidence = self.confidence_net(feat) * temperature
 
-        return confidence.clamp(0, 1)
+        return sigma, confidence.clamp(0, 1)
 
 
 # ============================================================================
@@ -546,18 +645,18 @@ class AdaptiveFusion(nn.Module):
         inf_n = len(inf_instances)
         veh_n = len(veh_instances)
 
-        # === Step 1: AAF - Altitude-Adaptive Fusion ===
-        aaf_feats, height_weight, inf_pts_norm = self.aaf(
+        # === Step 1: DGC (inside AAF) - altitude-aware residual correction ===
+        aaf_feats, height_weight, inf_pts_norm, altitude, delta_p = self.aaf(
             inf_instances, veh_instances, veh2inf_rt, inf_pc_range, pc_range
         )
 
         # === Step 2: ACM - Adaptive Confidence Modulation ===
-        # Compute displacement: difference between AAF-corrected and raw points
-        if hasattr(inf_instances, 'displacement') and inf_instances.displacement is not None:
-            displacement = inf_instances.displacement
-        else:
-            displacement = torch.zeros(inf_n, 3, device=device)
-        confidence = self.acm(displacement, inf_pts_norm)  # [N, 1]
+        # Δp is the displacement DGC actually applied — a geometric, feature-free
+        # signal, which is what keeps this branch orthogonal to CAA's loss.
+        # (Previously this read inf_instances.displacement, which was usually never
+        #  set and silently fell back to zeros, making the branch input-free.)
+        displacement = delta_p
+        sigma, confidence = self.acm(displacement, inf_pts_norm, altitude)
 
         # === Step 3: CAA - Context-Aware Association ===
         # Compute geometric confidence for matching
@@ -566,15 +665,22 @@ class AdaptiveFusion(nn.Module):
         # Get vehicle reference points
         veh_ref_pts_norm = veh_instances.ref_pts  # Assuming normalized
 
-        # Matching with uncertainty weighting
+        # Matching with an uncertainty-aware (Mahalanobis) tolerance
         inf_pts_exp = inf_pts_norm.unsqueeze(1).expand(inf_n, veh_n, 3)
         veh_pts_exp = veh_ref_pts_norm.unsqueeze(0).expand(inf_n, veh_n, 3)
-        distances = torch.sqrt(torch.sum((inf_pts_exp - veh_pts_exp) ** 2, dim=-1))
+        distances = torch.sqrt(torch.sum((inf_pts_exp - veh_pts_exp) ** 2, dim=-1) + 1e-12)
 
-        # Uncertainty-weighted distance
-        confidence_exp = confidence.unsqueeze(1).expand(inf_n, veh_n)
-        geo_conf_exp = inf_geo.unsqueeze(1).expand(inf_n, veh_n)
-        weighted_dist = distances * (1 + confidence_exp) / (geo_conf_exp + 1e-6)
+        # σ is in metres while ref_pts are normalised → rescale by the BEV extent.
+        sigma_scale = float(pc_range[3] - pc_range[0])
+        # sigma is already [N, 1]; broadcasting to [N, M] needs no extra dim.
+        # The previous `.unsqueeze(1)` made it [N, 1, 1] and expand() raised.
+        sigma_exp = (sigma / sigma_scale).expand(inf_n, veh_n)
+        mahal = distances / (sigma_exp + 1e-6)
+
+        # Both are [N, 1]; broadcast straight to [N, M] (unsqueeze was a bug).
+        confidence_exp = confidence.expand(inf_n, veh_n)
+        geo_conf_exp = inf_geo.expand(inf_n, veh_n)
+        weighted_dist = mahal * (1 + confidence_exp) / (geo_conf_exp + 1e-6)
 
         # Nearest neighbor matching
         filter_mask = weighted_dist < 2.0
@@ -687,6 +793,10 @@ class AdaptiveFusion(nn.Module):
 # Keep old class names as aliases for existing code
 UncertaintyPredictor = ACM  # ACM is the updated version
 GeometryConstraintLayer = CAA  # CAA is the expanded version
+# WARNING: this shadows the class of the SAME NAME in height_adaptive_fusion.py.
+# They are different implementations. The cooperative pipeline uses the other
+# one (`from .height_adaptive_fusion import HeightAdaptiveFusion`); this alias
+# is kept only for backward compatibility with older configs.
 HeightAdaptiveFusion = AdaptiveFusion  # Full integrated module
 GRUSpatioTemporalPredictor = VehicleGRU  # Renamed in Dual GRU refactor
 

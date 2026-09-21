@@ -63,8 +63,11 @@ class UncertaintyPredictor(nn.Module):
             nn.Linear(hidden_dim, 1),
         )
 
-        # Learnable temperature for calibration
-        self.log_temperature = nn.Parameter(torch.log(torch.tensor(0.1)))
+        # Learnable temperature for calibration.
+        # NOTE: temperature must start at 1.0. The previous init (log 0.1, i.e.
+        # temperature=0.1) *sharpened* the sigmoid into a near step function, which
+        # is the opposite of what temperature scaling is meant to do.
+        self.log_temperature = nn.Parameter(torch.tensor(0.0))
 
         self._init_weights()
 
@@ -98,6 +101,66 @@ class UncertaintyPredictor(nn.Module):
         return uncertainty, uncertainty_logit
 
 
+class LocalizationSigmaHead(nn.Module):
+    """
+    Per-query estimate σ_i of the BEV localisation error that SURVIVES DGC
+    correction, in metres. This is the quantity that drives the association
+    tolerance in CAA (d_pos / σ_i) and is supervised by a heteroscedastic NLL.
+
+    Two deliberate design choices:
+
+    1. Input is (Δp, P'_d, h) — geometry only, NO query features. This is what
+       keeps the confidence branch gradient-orthogonal to CAA's feature-space
+       matching loss; feeding features here would re-couple the two branches.
+
+    2. The first-order trend σ ∝ h is ANALYTIC, not learned. It follows from the
+       pinhole model (slant range grows with altitude while relative depth error
+       stays roughly constant), so the network only learns the multiplicative
+       deviation from it. That is why the head stays data-efficient and why the
+       tolerance extrapolates to altitudes outside the training range.
+    """
+
+    def __init__(self, hidden_dim=64, h_ref=25.0, sigma_min=0.1):
+        super(LocalizationSigmaHead, self).__init__()
+        self.h_ref = h_ref
+        self.sigma_min = sigma_min
+
+        self.net = nn.Sequential(
+            nn.Linear(7, hidden_dim),          # [Δp(3); P'_d(3); h(1)]
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, displacement, ref_pts, altitude):
+        """
+        Args:
+            displacement: [N, 3] Δp applied by DGC
+            ref_pts:      [N, 3] corrected reference points P'_d
+            altitude:     [N, 1] flight altitude h in metres
+
+        Returns:
+            sigma: [N, 1] localisation error estimate in metres (> 0)
+        """
+        if altitude is None:
+            raise ValueError("LocalizationSigmaHead requires the flight altitude h.")
+        if altitude.shape[0] != displacement.shape[0]:
+            altitude = altitude.expand(displacement.shape[0], 1)
+
+        x = torch.cat([displacement, ref_pts, altitude], dim=-1)   # [N, 7]
+        deviation = F.softplus(self.net(x))                          # > 0
+        h_ratio = (altitude / self.h_ref).clamp(min=1e-3)
+        return self.sigma_min + deviation * h_ratio                 # metres
+
+
 class GeometryConstraintLayer(nn.Module):
     """
     Geometry-aware constraint layer for robust matching.
@@ -113,9 +176,14 @@ class GeometryConstraintLayer(nn.Module):
     def __init__(self, embed_dims=256):
         super(GeometryConstraintLayer, self).__init__()
 
-        # Direction encoder (from motion features or bbox velocity)
+        # Direction encoder (from bbox velocity).
+        # pred_boxes follows CoopTrack's 10-D code (see detectors/cooptrack.py
+        # `pred_boxes = torch.zeros((len, 10))`):
+        #   [0:3] centre xyz | [3:6] dims wlh | [6:8] sin/cos yaw | [8:10] vel vx,vy
+        # so velocity is 2-D, exactly as spatial_temporal_reason.py slices it.
+        # It was previously declared Linear(3, ...) and blew up at runtime.
         self.direction_encoder = nn.Sequential(
-            nn.Linear(3, embed_dims // 4),
+            nn.Linear(2, embed_dims // 4),
             nn.ReLU(inplace=True),
         )
 
@@ -159,7 +227,7 @@ class GeometryConstraintLayer(nn.Module):
             geo_confidence: [N, 1] geometric confidence scores
         """
         # Extract velocity direction
-        velocity = pred_boxes[..., 8:11]  # [N, 3]
+        velocity = pred_boxes[..., 8:10]  # [N, 2] vx, vy — see layout note above
         dir_encoded = self.direction_encoder(velocity)
 
         # Extract scale (dimensions)
@@ -200,6 +268,12 @@ class HeightAdaptiveFusion(nn.Module):
         # --- 1. Uncertainty Predictor ---
         self.uncertainty_predictor = UncertaintyPredictor(embed_dims, hidden_dim // 2)
 
+        # --- 1b. Localisation σ head ---
+        # Produces the per-query σ_i that scales CAA's association tolerance.
+        self.sigma_head = LocalizationSigmaHead(
+            hidden_dim=hidden_dim // 4, h_ref=h_ref
+        )
+
         # --- 2. Sinusoidal Positional Encoding for altitude ---
         # Encoding altitude h and deviation Δh into a smooth high-d feature,
         # enabling extrapolation beyond training range (25-55m).
@@ -208,7 +282,17 @@ class HeightAdaptiveFusion(nn.Module):
         self.register_buffer('pe_freq', 10000 ** (2 * torch.arange(self.pe_dim // 4) / (self.pe_dim // 4)))
 
         # --- 3. Residual correction MLP (extrapolation-robust) ---
-        # Input: [PE(h); PE(Δh)] of dim 2 * (pe_dim//2)*2 = pe_dim, Output: ΔP ∈ R^3
+        # Input: [PE(h); PE(Δh)] of dim 2 * (pe_dim//2)*2 = pe_dim
+        # Output: [ΔP; s] ∈ R^4
+        #   [0:3] translation residual ΔP ∈ R^3
+        #   [3]   log-scale s along the line of sight (drone optical centre → point)
+        #
+        # The 4th DOF is the learnable replacement for the hand-crafted
+        # `refine_ratio` that the released Griffin codebase ships DISABLED:
+        #     ray = P - drone_pos;  P' = drone_pos + ray * refine_ratio
+        # A fixed analytic ratio cannot express altitude-dependent behaviour, so we
+        # predict log s from PE(h) instead. exp(s) keeps the scale strictly positive
+        # and s = 0 is the identity, preserving DGC's graceful fallback off-range.
         # This replaces the old learnable affine_W/affine_b which collapsed outside 25-55m.
         self.residual_mlp = nn.Sequential(
             nn.Linear(self.pe_dim, hidden_dim),
@@ -216,7 +300,7 @@ class HeightAdaptiveFusion(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 3),  # output ΔP ∈ R^3 (residual offset)
+            nn.Linear(hidden_dim, 4),  # output [ΔP ∈ R^3; s ∈ R]
         )
 
         # --- 4. Dynamic fusion weight network ---
@@ -277,28 +361,53 @@ class HeightAdaptiveFusion(nn.Module):
         pe = torch.cat([pe, pe], dim=-1)  # [N, pe_dim]
         return pe
 
-    def _residual_correction(self, ref_pts_veh):
+    def _residual_correction(self, ref_pts_veh, altitude, drone_pos=None):
         """
-        Apply extrapolation-robust residual correction:
-            P' = P + ΔP(h),   ΔP(h) = MLP([PE(h); PE(Δh)])
+        Apply extrapolation-robust residual correction, now with a 4th DOF:
+
+            P' = drone_pos + (P - drone_pos) · exp(s) + ΔP
+                 [ΔP; s] = MLP([PE(h); PE(Δh)])
 
         Args:
             ref_pts_veh: [N, 3] points in vehicle coordinate frame (absolute)
+            altitude:    [N, 1] (or [1, 1]) FLIGHT altitude h — the drone's height,
+                         one scalar per frame broadcast to N queries.
+                         NOTE: this must NOT be ref_pts_veh[..., 2]. That is each
+                         detected point's height above the ground plane (~0 for a
+                         car), which carries no altitude information whatsoever.
+            drone_pos:   [3] drone optical centre in the vehicle frame. Required to
+                         apply the line-of-sight scale; if None the 4th DOF is
+                         dropped and this degenerates to plain ΔP translation.
 
         Returns:
             corrected_pts: [N, 3] residual-corrected points
-            displacement: [N, 3] ΔP = corrected - raw
+            delta_p:       [N, 3] ΔP = corrected - raw (translation part)
+            log_scale:     [N, 1] s, the line-of-sight log-scale
         """
-        altitude = ref_pts_veh[..., 2:3]  # z-coordinate ≈ altitude in veh frame [N, 1]
-        height_diff = altitude - self.h_ref  # deviation from reference [N, 1]
+        if altitude.ndim == 2 and altitude.shape[0] == 1 and ref_pts_veh.shape[0] != 1:
+            altitude = altitude.expand(ref_pts_veh.shape[0], 1)
 
-        pe_h = self._alt_pe(altitude)         # [N, pe_dim]
-        pe_dh = self._alt_pe(height_diff)     # [N, pe_dim]
-        pe_input = pe_h + pe_dh               # [N, pe_dim]
+        height_diff = altitude - self.h_ref      # [N, 1]
 
-        delta_p = self.residual_mlp(pe_input)  # [N, 3] residual offset
-        corrected_pts = ref_pts_veh + delta_p  # residual correction
-        return corrected_pts, delta_p
+        pe_h = self._alt_pe(altitude)            # [N, pe_dim]
+        pe_dh = self._alt_pe(height_diff)        # [N, pe_dim]
+        pe_input = pe_h + pe_dh                  # [N, pe_dim]
+
+        delta = self.residual_mlp(pe_input)      # [N, 4]
+        delta_p = delta[..., :3]                 # [N, 3]
+        log_scale = delta[..., 3:4].clamp(-0.5, 0.5)  # [N, 1]
+
+        if drone_pos is not None:
+            # Line-of-sight scaling about the drone optical centre. This is the
+            # learnable stand-in for the analytic `refine_ratio` that the released
+            # Griffin codebase ships disabled.
+            drone_pos = drone_pos.reshape(1, 3)
+            ray = ref_pts_veh - drone_pos
+            corrected_pts = drone_pos + ray * torch.exp(log_scale) + delta_p
+        else:
+            corrected_pts = ref_pts_veh + delta_p
+
+        return corrected_pts, delta_p, log_scale
 
     def _loc_norm(self, locs, pc_range):
         """Normalize locations to [0, 1] range."""
@@ -316,7 +425,7 @@ class HeightAdaptiveFusion(nn.Module):
         locs[..., 2:3] = locs[..., 2:3] * (pc_range[5] - pc_range[2]) + pc_range[2]
         return locs
 
-    def align_reference_points(self, ref_pts_veh, altitude=None):
+    def align_reference_points(self, ref_pts_veh, altitude=None, drone_pos=None):
         """
         Align reference points through AAF's extrapolation-robust residual correction.
 
@@ -339,22 +448,40 @@ class HeightAdaptiveFusion(nn.Module):
                          coordinate frame (absolute, NOT normalized).
                          This is guaranteed by the caller via
                          apply_pose_transform() before entering GBA.
-            altitude: [N, 1] or scalar, current drone altitude.
-                      If None, inferred from ref_pts_veh[..., 2].
+            altitude: [N, 1] / [1, 1] / scalar — the DRONE FLIGHT ALTITUDE h.
+                      This is required. Inferring it from ref_pts_veh[..., 2]
+                      would be wrong: that is the object's height above the
+                      ground plane, not the drone's height.
+            drone_pos: [3] drone optical centre in the ego-vehicle frame
+                       (calib_inf2veh[:3, 3]). Enables the R^4 line-of-sight
+                       scale. Optional; without it the 4th DOF is dropped.
 
         Returns:
             corrected_pts: [N, 3] residual-corrected points (veh frame)
-            displacement: [N, 3] ΔP = corrected - raw (for ACM input)
+            delta_p:       [N, 3] ΔP = corrected - raw (for ACM input)
+            log_scale:     [N, 1] s, the line-of-sight log-scale
         """
         if altitude is None:
-            altitude = ref_pts_veh[..., 2:3]
-        elif isinstance(altitude, (int, float)):
-            altitude = torch.full_like(ref_pts_veh[..., :1], altitude)
+            # Fail loudly. Silently substituting ref_pts_veh[..., 2] here is what
+            # made the module altitude-blind in the first place: for ground objects
+            # that value is ~0 regardless of whether the drone flies at 25m or 55m,
+            # so PE(h) would encode a constant and ΔP(h) would collapse to a bias.
+            raise ValueError(
+                "align_reference_points requires the drone flight altitude `h`. "
+                "Pass altitude=calib_inf2veh[2, 3] (the drone's height in the "
+                "ego-vehicle frame); do not derive it from ref_pts_veh[..., 2]."
+            )
+        if isinstance(altitude, (int, float)):
+            altitude = torch.full_like(ref_pts_veh[..., :1], float(altitude))
+        elif isinstance(altitude, torch.Tensor) and altitude.ndim == 0:
+            altitude = torch.full_like(ref_pts_veh[..., :1], float(altitude.item()))
 
-        # Residual correction: P' = P + ΔP(h), ΔP = MLP(PE(h) + PE(Δh))
-        corrected_pts, delta_p = self._residual_correction(ref_pts_veh)
+        # Residual correction: [ΔP; s] = MLP(PE(h) + PE(Δh))
+        corrected_pts, delta_p, log_scale = self._residual_correction(
+            ref_pts_veh, altitude, drone_pos
+        )
 
-        return corrected_pts, delta_p
+        return corrected_pts, delta_p, log_scale
 
     def compute_projection_error_bound(self, height_diff, distance):
         """
@@ -400,16 +527,33 @@ class HeightAdaptiveFusion(nn.Module):
         # === Step 1: Coordinate transformation inf→vehicle ===
         inf_ref_pts = self._loc_denorm(inf_instances.ref_pts, inf_pc_range)
         calib = np.linalg.inv(veh2inf_rt.cpu().numpy().T)
-        calib = torch.from_numpy(calib).to(device)
+        calib = torch.from_numpy(calib).to(device=device, dtype=inf_ref_pts.dtype)
         inf_ref_pts_h = torch.cat([inf_ref_pts, torch.ones_like(inf_ref_pts[..., :1])], dim=-1).unsqueeze(-1)
         inf_ref_pts_veh = torch.matmul(calib, inf_ref_pts_h).squeeze(-1)[..., :3]
 
-        # === Step 2: Extrapolation-robust residual correction ===
-        # P' = P + ΔP(h),   ΔP(h) = MLP(PE(h) + PE(Δh))
+        # === Step 1b: flight altitude ===
+        # h is the DRONE's height in the ego-vehicle frame — one scalar per frame.
+        # (Previously this module used inf_ref_pts_veh[..., 2:3], the z coordinate
+        #  of each detected point. For ground objects that is ~0 whether the drone
+        #  flies at 25m or 55m, so PE(h) encoded a constant and ΔP(h) collapsed to
+        #  a per-query bias — the module was altitude-blind by construction.)
+        drone_pos = calib[:3, 3].detach()                        # [3]
+        altitude = drone_pos[2].reshape(1, 1).expand(inf_n, 1)   # [N, 1]
+
+        # === Step 2: Extrapolation-robust residual correction (R^4) ===
+        # P' = drone_pos + (P - drone_pos)·exp(s) + ΔP,
+        #      [ΔP; s] = MLP(PE(h) + PE(Δh))
         # This replaces the old affine normalization (P' = P*W + b) which
         # caused extrapolation collapse beyond the training altitude range.
-        inf_ref_pts_corrected, _ = self._residual_correction(inf_ref_pts_veh)
+        inf_ref_pts_corrected, delta_p, _ = self._residual_correction(
+            inf_ref_pts_veh, altitude, drone_pos
+        )
         inf_ref_pts_norm = self._loc_norm(inf_ref_pts_corrected, pc_range)
+
+        # === Step 2b: per-query σ, read from DGC's own displacement ===
+        # Geometry only — no query features — so this branch stays gradient
+        # orthogonal to CAA's feature-space matching loss.
+        inf_sigma = self.sigma_head(delta_p, inf_ref_pts_corrected, altitude)
 
         # === Step 3: Uncertainty prediction for inf queries ===
         inf_uncertainty, inf_uncertainty_logit = self.uncertainty_predictor(
@@ -425,10 +569,24 @@ class HeightAdaptiveFusion(nn.Module):
         veh_pts_exp = veh_ref_pts_norm.unsqueeze(0).expand(inf_n, veh_n, 3)
         distances = torch.sqrt(torch.sum((inf_pts_exp - veh_pts_exp) ** 2, dim=-1))
 
-        # Uncertainty-weighted distance
-        uncertainty_exp = inf_uncertainty.unsqueeze(1).expand(inf_n, veh_n)
-        geo_conf_exp = inf_geo_conf.unsqueeze(1).expand(inf_n, veh_n)
-        weighted_dist = distances * (1 + uncertainty_exp) / (geo_conf_exp + 1e-6)
+        # --- Mahalanobis tolerance -------------------------------------------
+        # A fixed Euclidean gate is altitude-blind: the same threshold is far too
+        # tight at 55m (where the localisation error is large) and far too loose at
+        # 25m. Dividing by σ_i — which grows with h — turns the gate into a
+        # "how many standard deviations apart" test that self-adjusts with altitude.
+        #
+        # Unit note: `distances` are computed on NORMALISED reference points, so σ
+        # (metres) must be rescaled by the same BEV extent to stay commensurate.
+        sigma_scale = float(pc_range[3] - pc_range[0])
+        # inf_sigma is already [N, 1]; broadcasting to [N, M] needs no extra dim.
+        # The previous `.unsqueeze(1)` made it [N, 1, 1] and expand() raised.
+        sigma_exp = (inf_sigma / sigma_scale).expand(inf_n, veh_n)
+        mahal = distances / (sigma_exp + 1e-6)
+
+        # Both are [N, 1]; broadcast straight to [N, M] (unsqueeze was a bug).
+        uncertainty_exp = inf_uncertainty.expand(inf_n, veh_n)
+        geo_conf_exp = inf_geo_conf.expand(inf_n, veh_n)
+        weighted_dist = mahal * (1 + uncertainty_exp) / (geo_conf_exp + 1e-6)
 
         # Nearest neighbor matching with confidence filtering
         filter_mask = weighted_dist < 2.0  # relaxed threshold with uncertainty
@@ -455,9 +613,12 @@ class HeightAdaptiveFusion(nn.Module):
         )
 
         # === Step 6: Dynamic height-weighted feature fusion with uncertainty ===
-        altitude = inf_ref_pts_veh[..., 2:3]
+        # (altitude already defined in Step 1b as the per-frame flight height)
         h_diff = altitude - self.h_ref
-        h_diff_expanded = h_diff.expand(-1, self.embed_dims)
+        # fusion_weight_net's first layer is Linear(embed_dims + 3, ...), so the
+        # altitude deviation must occupy 3 slots. Expanding it to embed_dims
+        # produced a 512-wide concat against a 259-wide layer.
+        h_diff_expanded = h_diff.expand(-1, 3)
         feat_concat = torch.cat([inf_instances.query_feats, h_diff_expanded], dim=-1)
         height_weight = self.fusion_weight_net(feat_concat).squeeze(-1)
 
@@ -517,3 +678,52 @@ class HeightAdaptiveFusion(nn.Module):
             reduction='mean'
         )
         return loss
+
+    # ------------------------------------------------------------------
+    # σ: prediction and heteroscedastic NLL supervision
+    # ------------------------------------------------------------------
+    def predict_sigma(self, displacement, ref_pts, altitude):
+        """
+        Per-query σ_i of the BEV localisation error surviving DGC correction.
+
+        Args:
+            displacement: [N, 3] Δp applied by DGC
+            ref_pts:      [N, 3] corrected reference points P'_d
+            altitude:     [N, 1] or [1, 1] flight altitude h in metres
+
+        Returns:
+            sigma: [N, 1] in metres
+        """
+        return self.sigma_head(displacement, ref_pts, altitude)
+
+    def compute_sigma_nll_loss(self, sigma, corrected_pts, gt_pts, mask=None):
+        """
+        Heteroscedastic negative log-likelihood for σ.
+
+        Supervising σ against the residual localisation error is what makes the
+        association tolerance *calibrated* rather than hand-set: σ_i is trained to
+        be the error it actually has, in metres, so `d_pos / σ_i` really is a
+        "how many standard deviations apart" test.
+
+            L = ½ (‖P'_d − P_gt‖ / σ)² + log σ
+
+        The log σ term is what stops the trivial solution σ → ∞.
+
+        Args:
+            sigma:         [N, 1] predicted σ in metres
+            corrected_pts: [N, 3] DGC-corrected drone points (veh frame, absolute)
+            gt_pts:        [N, 3] matched ground-truth centres (same frame)
+            mask:          optional [N] 0/1 weights
+
+        Returns:
+            loss: scalar
+        """
+        err = torch.norm(corrected_pts - gt_pts, dim=-1)      # [N]
+        s = sigma.squeeze(-1).clamp(min=1e-6)                 # [N]
+
+        loss = 0.5 * (err / s).pow(2) + torch.log(s)          # [N]
+
+        if mask is not None:
+            mask = mask.to(loss.dtype)
+            return (loss * mask).sum() / mask.sum().clamp(min=1.0)
+        return loss.mean()

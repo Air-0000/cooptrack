@@ -52,13 +52,27 @@ class ContextAwareAssociation(nn.Module):
         self.lambda_geo = nn.Parameter(torch.tensor(0.5))
         self.sigma_v = 1.0
         self.theta_geo = 1.0
+        # Gate for the Mahalanobis branch of forward(): reject pairs further apart
+        # than this many PREDICTED standard deviations (d/σ). 2.0 is ~95% under a
+        # Gaussian assumption and matches the gate used in AAF / AdaptiveFusion.
+        # Without it, the sigma!=None path raised AttributeError at runtime.
+        self.mahal_thresh = 2.0
 
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def forward(self, inf_instances, veh_instances):
+    def forward(self, inf_instances, veh_instances, sigma=None, sigma_scale=1.0):
         """
+        Args:
+            inf_instances, veh_instances: query instances (ref_pts NORMALISED)
+            sigma:       [N_inf, 1] per-query localisation σ in METRES. When given,
+                         the geometric term switches from a fixed Euclidean scale
+                         to a Mahalanobis form d/σ that widens with altitude.
+            sigma_scale: metres → normalised-units conversion. Must equal the BEV
+                         extent used to normalise ref_pts, i.e.
+                         pc_range[3] - pc_range[0].
+
         Returns:
             cost_matrix: [N_veh, N_inf]
             filter_mask: [N_veh, N_inf]
@@ -78,7 +92,18 @@ class ContextAwareAssociation(nn.Module):
         veh_exp = veh_instances.ref_pts.unsqueeze(0).expand(inf_n, veh_n, 3)
         pos_dist = torch.sqrt(torch.sum((inf_exp - veh_exp) ** 2, dim=-1))
 
-        geo_score = torch.exp(-pos_dist / self.theta_geo)
+        if sigma is not None:
+            # Mahalanobis form: how many PREDICTED standard deviations apart.
+            # theta_geo is a constant, so the old exp(-d/theta) gate applied the
+            # same tolerance at 25m and at 55m even though the localisation error
+            # differs by ~2x. d/σ self-adjusts with altitude.
+            sigma_n = (sigma / float(sigma_scale)).clamp(min=1e-6)  # [N_inf, 1]
+            mahal = pos_dist / sigma_n                              # [N_inf, N_veh]
+            geo_score = torch.exp(-0.5 * mahal.pow(2))
+            geo_filter = (mahal.T < self.mahal_thresh).detach().cpu().numpy()
+        else:
+            geo_score = torch.exp(-pos_dist / self.theta_geo)
+            geo_filter = (pos_dist.T < self.theta_geo).detach().cpu().numpy()
 
         # Combined matching score
         sem_score = (sem_sim - sem_sim.min()) / (sem_sim.max() - sem_sim.min() + 1e-6)
@@ -87,7 +112,6 @@ class ContextAwareAssociation(nn.Module):
         cost_matrix = (1.0 - combined_score).detach().cpu().numpy()
 
         sem_filter = (sem_sim.T > self.sigma_v).detach().cpu().numpy()
-        geo_filter = (pos_dist.T < self.theta_geo).detach().cpu().numpy()
         filter_mask = sem_filter & geo_filter
 
         return cost_matrix, filter_mask
@@ -237,10 +261,16 @@ class CrossAgentSparseInteraction(nn.Module):
                 disp_norm = torch.norm(matched_inf.displacement[inf_accept_idx], dim=-1, keepdim=True)
             else:
                 disp_norm = torch.zeros(len(matched_inf), 1, device=matched_inf.query_feats.device)
-            _, uncertainty_logit = self.height_adaptive_fusion.uncertainty_predictor(
+            uncertainty, uncertainty_logit = self.height_adaptive_fusion.uncertainty_predictor(
                 matched_inf.query_feats, matched_veh.ref_pts
             )
-            w = torch.sigmoid(uncertainty_logit / 10.0)  # [N, 1]
+            # `uncertainty` is the calibrated aerial-branch uncertainty in (0, 1).
+            # `w` is the weight placed on the AERIAL branch, so it must DECREASE as
+            # uncertainty grows. (Previously this used sigmoid(logit/10.0) directly,
+            # which (a) had the sign inverted -- a more uncertain aerial query received
+            # MORE weight -- and (b) divided by a hard-coded 10.0, squashing w into
+            # roughly [0.38, 0.62] and making the gate effectively a constant.)
+            w = 1.0 - uncertainty  # [N, 1]
             fused_feats = self.height_adaptive_fusion.fusion_mlp(
                 torch.cat([
                     matched_veh.query_feats * (1 - w),
@@ -318,19 +348,34 @@ class CrossAgentSparseInteraction(nn.Module):
         if debug:
             self._vis(inf_ref_pts, veh_ref_pts, veh.scores, vis_threshold=0.0, name=name)
 
-        # === AAF: Correct reference points BEFORE matching (隐患 1 修复) ===
+        # === DGC: Correct reference points BEFORE matching (隐患 1 修复) ===
         if self.use_aaf and hasattr(self, 'height_adaptive_fusion'):
-            # inf_ref_pts is already in vehicle coordinate frame from inf2veh transform above
-            corrected_inf_pts, delta_p = self.height_adaptive_fusion.align_reference_points(
-                inf_ref_pts, altitude=inf_ref_pts[..., 2:3]
+            # Flight altitude = the drone's height in the ego-vehicle frame.
+            # calib_inf2veh[:3, 3] is the drone optical centre expressed in the
+            # vehicle frame, so [2] is its height — one scalar per frame.
+            # (Previously this passed inf_ref_pts[..., 2:3], each detected point's
+            #  z coordinate. For ground objects that is ~0 whether the drone flies
+            #  at 25m or 55m, so PE(h) encoded a constant and the correction never
+            #  actually saw the altitude. This is the altitude-blind bug.)
+            drone_pos_in_veh = calib_inf2veh[:3, 3].detach()      # [3]
+            flight_altitude = drone_pos_in_veh[2].reshape(1, 1)    # [1, 1]
+
+            corrected_inf_pts, delta_p, log_scale = self.height_adaptive_fusion.align_reference_points(
+                inf_ref_pts, altitude=flight_altitude, drone_pos=drone_pos_in_veh
             )
-            # Use AAF-corrected points for matching
+            # Use DGC-corrected points for matching
             inf_ref_pts_corrected = corrected_inf_pts
-            # Store displacement for ACM loss (used in adaptive_fusion.py)
+            # Store displacement for the ACM / σ branch
             inf.displacement = delta_p
+            # Per-query σ, read from Δp (geometry only, no features) — this feeds
+            # CAA's association tolerance and the heteroscedastic NLL loss.
+            inf.sigma = self.height_adaptive_fusion.predict_sigma(
+                delta_p, corrected_inf_pts, flight_altitude
+            )
         else:
             inf_ref_pts_corrected = inf_ref_pts
             inf.displacement = torch.zeros_like(inf_ref_pts)
+            inf.sigma = None
 
         # ref_pts normalization (from corrected coordinates)
         inf_ref_pts_norm = self._loc_norm(inf_ref_pts_corrected, self.pc_range)
@@ -342,7 +387,14 @@ class CrossAgentSparseInteraction(nn.Module):
             inf_for_caa.ref_pts = inf_ref_pts_norm
             veh_for_caa = veh.clone()
             veh_for_caa.ref_pts = veh_ref_pts_norm
-            cost_matrix_caa, filter_mask_caa = self.caa(inf_for_caa, veh_for_caa)
+            # σ is in metres while ref_pts are normalised, so convert with the
+            # BEV extent used by _loc_norm.
+            sigma_scale = float(self.pc_range[3] - self.pc_range[0])
+            cost_matrix_caa, filter_mask_caa = self.caa(
+                inf_for_caa, veh_for_caa,
+                sigma=getattr(inf, 'sigma', None),
+                sigma_scale=sigma_scale,
+            )
             cost_matrix_caa[~filter_mask_caa] = 1e6
             idx_veh, idx_inf = linear_sum_assignment(cost_matrix_caa)
             cost_matrix = cost_matrix_caa

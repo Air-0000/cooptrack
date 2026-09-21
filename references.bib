@@ -1,3 +1,40 @@
+% ============================================================================
+% WARNING: THIS BIBLIOGRAPHY IS NOT VERIFIED -- DO NOT SUBMIT AS IS.
+%
+% Most entries were generated with PLACEHOLDER author names and must be
+% replaced from DBLP / the published version. Known issues:
+%   * Any entry with "author={Anonymous}" or "... and others" has INVENTED
+%     authors. This affects roughly half the file, including bevformer, petr,
+%     bevdepth, futr3d, uvtr, sensorfusion and the uncertainty-* entries.
+%   * Confirmed and corrected:
+%       griffin    -- was a DIFFERENT dataset ("A Real-world Dataset for
+%                     Aerial-Ground Cooperative 3D Detection", CVPR 2024);
+%                     corrected to AAAI 2026, Wang et al., arXiv:2503.06983.
+%       sparsecoop -- title was invented; real title is "SparseCoop:
+%                     Cooperative Perception with Kinematic-Grounded Queries".
+%       bevformer  -- real authors: Li, Wang, Li, Xie, Sima, Lu, Qiao, Dai.
+%       petr       -- real authors: Liu, Wang, Zhang, Sun.
+%       cooptrack  -- our PRIMARY baseline: BOTH the title and the author list
+%                     were fabricated, and the invented title even contradicted
+%                     this repo's own README. Corrected from the official
+%                     repository's BibTeX (Zhong, Wang, Xu, Li, Nie, Yu;
+%                     ICCV 2025, Highlight).
+%
+%   * STILL UNVERIFIED — DBLP was unreachable (blocked by anti-scraping), so
+%     these could not be checked automatically:
+%       longscope, agcdrive, v2u4real, airv2x, airv2x_perception,
+%       opencood_air, uvcpnet, refptsfusion, umoe, hyperv2x, mambafusion,
+%       adabev, cobevfusion, posifusion, v2xpnp, v2xvit, robust_benchmark,
+%       crall (venue unknown; its listed arXiv ID was CoopTrack's and was removed).
+%
+%   * ENVIRONMENT: no dependency conflict. Griffin's requirements.txt pins
+%     motmetrics==1.1.3 / einops==0.4.1 / yapf==0.40.1 / setuptools==59.5.0 —
+%     byte-identical to ours — plus pillow==9.0.0, tensorboard==2.12.0, wandb.
+%
+%   * Recommended fix: export each entry from DBLP in a browser and paste it
+%     over these. Do NOT invent author names to fill the remaining gaps —
+%     a wrong-but-plausible citation is worse than an obvious placeholder.
+% ============================================================================
 @inproceedings{robust_benchmark,
     title={Benchmarking Robustness of 3D Object Detection to Common Corruptions in Autonomous Driving},
     author={Anonymous},
@@ -6,24 +43,30 @@
 }
 
 @inproceedings{cooptrack,
-    title={CoopTrack: Query-based Cooperative 3D Tracking for Aerial-Ground System},
-    author={Zhang, Yiming and Wang, Xiaogang and others},
+    title={CoopTrack: Exploring End-to-End Learning for Efficient Cooperative Sequential Perception},
+    author={Zhong, Jiaru and Wang, Jiahao and Xu, Jiahui and Li, Xiaofan and Nie, Zaiqing and Yu, Haibao},
     booktitle={Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
-    pages={1--12},
-    year={2025}
+    year={2025},
+    note={Selected as Highlight},
+    eprint={2507.19239},
+    archivePrefix={arXiv},
+    primaryClass={cs.CV}
 }
 
 @inproceedings{griffin,
-    title={Griffin: A Real-world Dataset for Aerial-Ground Cooperative 3D Detection},
-    author={Li, Wei and Chen, Ming and Wang, Lei and others},
-    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-    pages={1--12},
-    year={2024}
+    title={Griffin: Aerial-Ground Cooperative Detection and Tracking Dataset and Benchmark},
+    author={Wang, Jiahao and Cao, Xiangyu and Zhong, Jiaru and Zhang, Yuner and Yu, Haibao and He, Lei and Xu, Shaobing},
+    booktitle={Proceedings of the AAAI Conference on Artificial Intelligence (AAAI)},
+    year={2026},
+    eprint={2503.06983},
+    archivePrefix={arXiv},
+    primaryClass={cs.CV},
+    url={https://arxiv.org/abs/2503.06983}
 }
 
 @inproceedings{bevformer,
     title={BEVFormer: Learning Bird's-Eye-View Representation from Multi-Camera Images via Spatiotemporal Transformers},
-    author={Li, Zhi and Wang, Yuqing and Hong, Zonghong and others},
+    author={Li, Zhiqi and Wang, Wenhai and Li, Hongyang and Xie, Enze and Sima, Chonghao and Lu, Tong and Qiao, Yu and Dai, Jifeng},
     booktitle={European Conference on Computer Vision (ECCV)},
     pages={1--18},
     year={2022}
@@ -31,7 +74,7 @@
 
 @inproceedings{petr,
     title={PETR: Position Embedding Transformation for Multi-View 3D Object Detection},
-    author={Liu, Yingyan and Ma, Tiancai and Wang, Zhaoxiang},
+    author={Liu, Yingfei and Wang, Tiancai and Zhang, Xiangyu and Sun, Jian},
     booktitle={European Conference on Computer Vision (ECCV)},
     pages={1--17},
     year={2022}
@@ -40,7 +83,7 @@
 @article{crall,
     title={CRALL-Ev2X: Communication-efficient Robust Asymmetric Late Fusion for EV2X},
     author={Chen, Yuhua and Wang, Tao and Guo, Bin and others},
-    journal={arXiv preprint arXiv:2507.19239},
+    note={Venue/arXiv UNVERIFIED. The ID 2507.19239 previously listed here is CoopTrack's, not this paper's},
     year={2025}
 }
 
@@ -140,6 +183,52 @@
 %===============================================================================
 % Aerial-Ground Cooperative Perception References
 %===============================================================================
+
+% TODO(verify): 以下 6 条由评审意见要求补充，作者名/页码/arXiv 号需按正式发表版本核对，
+% 当前占位信息来自用户提供的会议年份，请勿直接投稿。
+@inproceedings{sparsecoop,
+    title={SparseCoop: Cooperative Perception with Kinematic-Grounded Queries},
+    author={Anonymous},
+    booktitle={Proceedings of the AAAI Conference on Artificial Intelligence (AAAI)},
+    year={2026}
+}
+
+@inproceedings{longscope,
+    title={Long-SCOPE: Long-Term Spatial-Temporal Cooperative Perception},
+    author={Anonymous},
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year={2026}
+}
+
+@inproceedings{agcdrive,
+    title={AGC-Drive: Aerial-Ground Cooperative Driving Perception and Prediction},
+    author={Anonymous},
+    booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+    year={2025}
+}
+
+@inproceedings{v2u4real,
+    title={V2U4Real: A Real-World Benchmark for Vehicle-to-UAV Collaborative Perception},
+    author={Anonymous},
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year={2026}
+}
+
+@inproceedings{refptsfusion,
+    title={RefPtsFusion: Reference-Point based Multi-Agent Collaborative Perception},
+    author={Anonymous},
+    booktitle={To be confirmed},
+    note={Venue and year to be confirmed against the published version.},
+    year={2025}
+}
+
+@inproceedings{airv2x_perception,
+    title={AirV2X-Perception: A Benchmark for Unified Air-Ground Cooperative Perception},
+    author={Anonymous},
+    booktitle={To be confirmed},
+    note={Venue and year to be confirmed against the published version.},
+    year={2025}
+}
 
 @inproceedings{opencood_air,
     title={OpenCOOD-Air: V2V Collaborative Perception to Ground-Air Heterogeneous Integration},
